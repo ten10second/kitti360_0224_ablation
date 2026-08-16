@@ -81,17 +81,51 @@ KITTI-360 8 drive 共享全局世界系（Day-0 已验证），地理簇：{0002
   - B1：`--use_sat false`；B0：`--use_src false`
 - 实测吞吐：bs=8，0.50 s/it（RTX 4090，含 DINOv2 前向）。
 
-## 5. 「删除」项的落地方式（对照 §6 删除清单）
+## 5. 「删除」项的落地方式（对照 §6 删除清单，已实际执行）
 
-| 删除项 | 新框架中的状态 |
+git：快照 `a32d6a8`（改造前完整状态）→ 删除提交 `adf92fc`（**62 files，-19,730 行 / +186 行**）。任何删除可 `git checkout a32d6a8 -- <path>` 找回。
+
+### 5.1 整文件删除（51 个）
+
+| 删除项 | 文件 |
 |---|---|
-| anchor routing（极坐标 anchors/高斯偏置/RBF 广播） | **不在新 import 链**（`icassp27_predictor.py` 不 import `pose_aware_anchor_query`） |
-| RayRoPE | 同上；替换为标准 1D learned PE |
-| BEV unproject + F_bev 双线性采样 | 同上（`compute_inverse_projection_view`/`warp_bev_to_camera*` 不再被训练路径调用） |
-| Stage 2（mutual-NN/L_align/L_nce/两阶段） | 训练器只有单循环 CE，`consistency_loss`/`anchor_view_*` 不被 import |
-| SatMAE 主通路 | `sat_encoder=satmae` 未接线（NotImplementedError 占位），DINOv2 为主 |
+| anchor routing | `models/stage2/pose_aware_anchor_query.py`、`models/stage2/simplified_token_predictor_bk.py`（含活体 PoseRouteCrossAttn/FiLM 的备份） |
+| Stage-2 全部 | `world3d/train/train_anchor_view_stage2.py`、`consistency_loss.py`（mutual-NN + L_align + L_nce）、`anchor_view_consistency_loss.py`、`anchor_view_conditioning.py`、`view_pairing.py`、`scripts/infer_anchor_view_stage2.py`、configs `ar_anchor_view / ar_direct_consistency / ar_hybrid_enhanced_consistency` |
+| BEV 地面 unproject + F_bev 通路 | `world3d/train/geometry_ar.py`、`world3d/train/conditioning_ar.py`、`utils/geometry/bev_to_camera_warp.py`、`camera_to_sat_projection.py`、`camera_to_camera_ground.py`、`differentiable_projection.py`、`pose_loss.py`、`homography.py`、`utils/losses/`（geometric_loss/dcn_loss，无引用者）、`world3d/models/bev_downsample.py` + IPM 可视化工具（`tools/vis_warp_from_dataloader.py`、`vis_kitti360d_bev_fov.py`、`vis_fixed_five_views_ipm.py`、根目录 `debug_ipm_alignment*.py`） |
+| RayRoPE 备份/死代码 | （类本体在 predictor 重写中删除）`world3d/models/ray_coordinate_encoder.py`、`direct_predictor_modules.py`（均无引用者） |
+| MM26 训练/推理栈 | `scripts/infer_{yaw_sweep,yaw_sweep_batched,direct_yaw_sweep,vanilla_ar,vanilla_yaw_sweep,test_frames,anchor_view_stage2}.py`、`scripts/evaluate_metrics{,_optimized}.py`（依赖已删模块）、trainer/train `{maskgit,oneslot}` 四件、configs `ar / ar_direct / ar_hybrid{,_anchor,_enhanced} / ar_oneslot{,_warmstart} / maskgit` |
+| 替换掉的 95/5 切分 | `scripts/prepare_train_test_split.py`（MM26 killer 2 泄漏源；由 `make_geofence_split_kitti360.py` 替代） |
 
-旧文件（`trainer_ar.py`、`simplified_token_predictor.py`、`pose_aware_anchor_query.py`、`train_anchor_view_stage2.py` 等）原样保留——供旧 runs 复现与后续 `geo=rayrope/ipm`、`sat_encoder=satmae` 消融行回接。
+### 5.2 文件内删除/重写
+
+| 文件 | 改动 |
+|---|---|
+| `models/stage2/simplified_token_predictor.py` | **重写为 vanilla-only**（~2000→~330 行）：删 RayRoPEEncoder/RayDirectionEncoder/PoseRouteCrossAttn/AnchorBasedSpatialFiLM/PoseAwareAnchorQuery 接线/SemanticEncoder/BEV grid_sample/direct+hybrid 模式；保留 GPT 骨架（causal self-attn + cross-attn）、CacheableAttention（仅 KV-cache，RoPE 分支删除）、topleft/bottomup teacher-forcing、e_pose（VanillaPoseProjector）；mode≠vanilla 直接抛错 |
+| `world3d/train/trainer_ar.py` | 剥离：IPM warp 块、BEV 编码/SatMAE 构建、BEV 可见性 mask、一致性损失块（use_consistency_loss）、anchor-view resume 容错与可视化钩子；condition_tokens 只剩 pose；loss_history 3 元组 |
+| `world3d/config.py` | 删字段：mode/fourier_freqs/train_bev_encoder/no_bev_pretrain/n_pose_queries/hybrid_memory_source/use_ipm_semantic/use_explicit_token_pos/semantic_dim、pair-consistency 块、consistency 块、anchor-view 块（16 字段）、MaskGIT/OneSlot 块 |
+| `world3d/data/ar_pipeline.py` | 删 BEV mask 对 geometry_ar/conditioning_ar 的依赖；`compute_bev_visibility_mask` 重写为自包含 helper（diffusion 分支仍用，不属 AR 删除目标） |
+| `configs/ar_vanilla.yaml` | drives 改为 geofence-safe（剔除 test {0002,0003} / val {0007}）、data_root 指本机、num_workers=0（本机 cv2-fork 规避） |
+| `world3d/train/train_ar.py` | 默认 config `configs/ar.yaml`→`ar_vanilla.yaml` |
+| 各 `__init__.py` | `models/stage2`（去 PoseAwareAnchorQuery）、`world3d/models`（清空死导出）、`utils/geometry`（去 6 个 BEV 族模块导出） |
+| `scripts/run_metrics_eval.py` | SegAnyConsistency 改可选 import（**改造前即坏**，git 快照验证；顺手修复） |
+
+### 5.3 按清单"保留为消融分支"的
+
+- `models/multiscale_vit_encoder.py`（SatMAE/fMoW ViT-L）+ `ckpts/fmow_pretrain.pth`：文件保留，主通路已无引用；未来 `--sat_encoder satmae` 消融行回接。
+- diffusion 分支（`trainer_diffusion.py`、`diffusion_model.py` 等）：不在删除清单，原样保留并验证可 import。
+
+### 5.4 删除后验证
+
+- 全部存活入口 import OK（新栈 3 + legacy vanilla 5 + diffusion 3 + 共享模块 8 + metrics 2）
+- 新栈 30 步真实训练 OK（28,738 tuples，36.6M 参数）
+- legacy vanilla 2 步真实训练 OK（geofence-safe 5 drives，201,160 五视图样本）
+- vanilla predictor 单测：logits 形状、backward、KV-cache 增量步、bottomup 序、mode 守卫（direct 拒绝）
+- 环境补装 tensorboard/pytorch-fid（requirements 内列出但缺失）
+
+### 5.5 已知行为差异（非缺陷）
+
+- legacy trainer 多 worker（cv2-fork）在本机 abort——**改造前即存在**（数据管线未动），ar_vanilla.yaml 已固化 num_workers=0。
+- 旧 MM26 runs/ 的 ckpt 与新 predictor 不兼容（state_dict 键不同）——旧结果复现请用快照 `a32d6a8`。
 
 ## 6. 已知限制 / 待办（进入 Day-1+）
 
