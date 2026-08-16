@@ -173,13 +173,15 @@ class ICASSP27Predictor(nn.Module):
         self.sat_px = sat_px
         self.sat_m_per_px = sat_m_per_px
 
-        # encoders (shared DINOv2 for sat & street, doc §3.3)
+        # encoders (shared DINOv2 for sat & street, doc §3.3).
+        # Branch-specific heads are built ONLY when their branch is enabled,
+        # so ablation variants carry no dead parameters.
         self.dino = DinoV2Encoder(dino_arch)
-        self.sat_proj = nn.Linear(self.dino.dim, d_model)
-        self.src_proj = nn.Linear(self.dino.dim, d_model)
-        self.metric_pe = MetricPE(d_model, fourier_freqs)
-        self.rel_pose = RelPoseProjector(d_model)
-        self.ray_pe = TargetRayPE(d_model)
+        self.sat_proj = nn.Linear(self.dino.dim, d_model) if use_sat else None
+        self.src_proj = nn.Linear(self.dino.dim, d_model) if use_src else None
+        self.metric_pe = MetricPE(d_model, fourier_freqs) if use_sat else None
+        self.rel_pose = RelPoseProjector(d_model) if use_src else None
+        self.ray_pe = TargetRayPE(d_model) if geo == "raymap" else None
         self.pose_proj = VanillaPoseProjector(pose_dim, d_model)  # e_pose reuse
         self.geo = geo
         self.target_rows = int(target_rows)
