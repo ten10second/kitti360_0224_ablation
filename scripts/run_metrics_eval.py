@@ -24,9 +24,13 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from metrics import (
     PSNR, SSIM, LPIPS, FID,
-    P_Squeeze, DINOSimilarity, SegAnyConsistency,
+    P_Squeeze, DINOSimilarity,
     DepthConsistency, LRCE, MultiViewConsistency
 )
+try:
+    from metrics import SegAnyConsistency  # requires segment_anything library
+except ImportError:
+    SegAnyConsistency = None
 
 
 def parse_args():
@@ -149,6 +153,8 @@ def init_metrics(args) -> Dict:
             device=args.device
         )
     if args.segany:
+        if SegAnyConsistency is None:
+            raise SystemExit("--segany requires the segment_anything library (SegAnyConsistency disabled at import)")
         metrics['segany'] = SegAnyConsistency(
             reduction='none',
             sam_checkpoint=args.sam_checkpoint,

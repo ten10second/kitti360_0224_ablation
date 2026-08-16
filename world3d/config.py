@@ -60,11 +60,6 @@ class ArTrainConfig:
         "static_graph": False,
     })
 
-    # Pair consistency optimization
-    pair_sat_size: int = 256
-    pair_max_pairs_per_frame: int = 2
-    min_overlap_pixels: int = 200
-
     # DDP / DataLoader (backward compatibility)
     num_workers: int = 0
     ddp_strict_view: bool = True
@@ -99,32 +94,26 @@ class ArTrainConfig:
     vis_temperature: float = 1.0
 
     # IPM correction angles (degrees)
-    roll_deg: float = 0.0  # Roll correction for IPM
-    pitch_deg: float = 0.0  # Pitch correction for IPM
-    use_ipm_semantic: bool = True  # Whether to use IPM semantic features (direct/hybrid modes only)
+    roll_deg: float = 0.0  # Roll correction for virtual-view rectification (dataloader)
+    pitch_deg: float = 0.0  # Pitch correction for virtual-view rectification (dataloader)
 
     # Model
-    mode: str = "direct"  # "vanilla", "direct", or "hybrid"
-    fourier_freqs: int = 10
+    # (mode/fourier_freqs/train_bev_encoder/no_bev_pretrain/n_pose_queries/
+    #  hybrid_memory_source/use_ipm_semantic/use_explicit_token_pos/semantic_dim
+    #  removed with the direct/hybrid/anchor/RayRoPE/BEV paths in the ICASSP27 refactor)
     ntp_order: str = "topleft"  # topleft|bottomup
-    train_bev_encoder: bool = False
-    no_bev_pretrain: bool = False
     d_model: int = 512
     nhead: int = 8
     num_layers: int = 8
     dim_feedforward: int = 2048
     dropout: float = 0.1
     max_seq_len: int = 1080
-    semantic_dim: int = 4
     pose_dim: int = 13
     use_pose_token: bool = True
     vocab_size: int = 1024
     grid_cols: int = 40
     grid_rows: int = 16
     bos_token: int = 1024
-    n_pose_queries: int = 64
-    hybrid_memory_source: str = "enhanced"  # "enhanced" | "anchor" | "anchor_tokens"
-    use_explicit_token_pos: bool = False  # explicit token positional embedding (can be used with RoPE)
 
     # Optim
     lr: float = 1e-4
@@ -135,54 +124,13 @@ class ArTrainConfig:
     label_smoothing: float = 0.0
     ce_weight: float = 1.0
 
-    # Geometric consistency (BEV pair loss)
-    use_pair_consistency: bool = False
-    pair_weight: float = 0.1
-    pair_temperature: float = 1.0
-
-    # Multi-view semantic consistency loss
-    use_consistency_loss: bool = False
-    consistency_weight: float = 0.1
-    consistency_temperature: float = 0.5
-    consistency_use_cosine: bool = True
-    consistency_nce_weight_max: float = 0.1
-    consistency_nce_ramp_start: int = 10000
-    consistency_nce_ramp_end: int = 20000
-
-    # Anchor-view conditional training
-    use_anchor_view_training: bool = False
-    anchor_view_source: str = "generated"  # "generated" | "gt"
-    anchor_view_use_consistency: bool = False
-    anchor_view_consistency_weight: float = 0.2
-    anchor_view_ce_weight: float = 1.0
-    anchor_view_baseline_ce_weight: float = 0.3
-    anchor_feature_loss_weight: float = 1.0   # 特征对齐损失权重
-    anchor_consistency_temperature: float = 0.5
-    anchor_distance_threshold: float = 0.05
-    anchor_view_top_k: int = 1
-    anchor_view_temperature: float = 1.0
-    anchor_view_dropout_prob: float = 0.3
-    anchor_view_cache_dir: Optional[str] = None
-    anchor_view_mem_cache_size: int = 2048
-    anchor_view_cache_only: bool = False
-
+    # (pair-consistency / multi-view consistency / anchor-view stage-2 /
+    #  MaskGIT / OneSlot blocks removed with their trainers in the ICASSP27 refactor)
 
     # Scheduler
     use_warmup_cosine: bool = False
     warmup_updates: int = 4000
     min_lr: float = 1e-6
-
-    # MaskGIT
-    maskgit_mode: bool = False
-    maskgit_num_steps: int = 12
-    maskgit_temperature: float = 1.0
-    maskgit_top_k: int = 50
-
-    # OneSlot curriculum masking
-    oneslot_mask_start_ratio: float = 1.0
-    oneslot_mask_end_ratio: float = 1.0
-    oneslot_mask_ramp_steps: int = 0
-    oneslot_mask_schedule: str = "cosine"  # "linear" | "cosine"
 
 
 @dataclass

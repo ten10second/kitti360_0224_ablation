@@ -1,29 +1,19 @@
-# Vanilla AR ablation study - without physical coordinate mapping and 3D spatial perception
+# Legacy vanilla AR baseline (post-ICASSP27 refactor: vanilla-only predictor,
+# pose token memory; BEV/anchor/RayRoPE paths removed).
+# Drives follow the geofence split (dataset_splits/kitti360_geofence_buffer30):
+# train = {0000,0005,0006,0009,0010}; {0002,0003}=test, {0007}=val are excluded.
 device: cuda
 
-# Model mode: "vanilla"
-mode: "vanilla"
-
 # Data - Multi-drive configuration
-data_root: "/media/zhimiao/Lenovo/KITTI-360"
-# List of drives to use for training (using pre-split train frames)
+data_root: "/media/shizhm/Lenovo/KITTI-360"
 drives:
   - name: "2013_05_28_drive_0000_sync"
-    frames_file: "train_frames.txt"
-    weight: 1.0
-  - name: "2013_05_28_drive_0002_sync"
-    frames_file: "train_frames.txt"
-    weight: 1.0
-  - name: "2013_05_28_drive_0003_sync"
     frames_file: "train_frames.txt"
     weight: 1.0
   - name: "2013_05_28_drive_0005_sync"
     frames_file: "train_frames.txt"
     weight: 1.0
   - name: "2013_05_28_drive_0006_sync"
-    frames_file: "train_frames.txt"
-    weight: 1.0
-  - name: "2013_05_28_drive_0007_sync"
     frames_file: "train_frames.txt"
     weight: 1.0
   - name: "2013_05_28_drive_0009_sync"
@@ -46,7 +36,6 @@ yaw_min_abs: 0.0
 yaw_max_abs: 40.0
 use_fixed_five_views: true
 fixed_view_turn_deg: 30.0
-fourier_freqs: 10
 
 # Performance optimization parameters
 perf:
@@ -56,20 +45,16 @@ perf:
   torch_compile: false
 
 # DataLoader optimization
+# (num_workers=0: cv2 remap inside forked workers aborts on this machine)
 loader:
-  num_workers: 8
+  num_workers: 0
   prefetch_factor: 2
-  persistent_workers: true
+  persistent_workers: false
 
 # DDP optimization
 dist:
   find_unused_parameters: true
   static_graph: false
-
-# Pair consistency optimization
-pair_sat_size: 256
-pair_max_pairs_per_frame: 2
-min_overlap_pixels: 200
 
 # DDP / DataLoader (backward compatibility)
 num_workers: 8
@@ -81,15 +66,12 @@ virtual_h: 256
 
 # Model architecture
 ntp_order: "topleft"
-train_bev_encoder: false
-no_bev_pretrain: false
 d_model: 512
 nhead: 8
 num_layers: 8
 grid_cols: 40
 grid_rows: 16
 bos_token: 1024
-n_pose_queries: 64
 
 # Training
 steps: 80000
@@ -103,11 +85,6 @@ warmup_updates: 4000
 min_lr: 1.0e-6
 label_smoothing: 0.0
 ce_weight: 1.0
-
-# BEV Pair Consistency Loss (latent-space version)
-use_pair_consistency: false
-pair_weight: 0.1
-pair_temperature: 1.0
 
 # Checkpointing & Logging
 out_dir: "runs/ar_vanilla"

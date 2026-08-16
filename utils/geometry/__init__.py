@@ -1,5 +1,9 @@
 """
 Geometry utilities for coordinate transformations and calibration loading.
+
+(Removed in the ICASSP27 refactor: bev_to_camera_warp, camera_to_sat_projection,
+camera_to_camera_ground, differentiable_projection, pose_loss, homography —
+all ground-plane BEV warp machinery of the deleted MM26 path.)
 """
 
 from .kitti_transforms import (
@@ -20,35 +24,6 @@ from .pose_encoding import (
     rotation_matrix_to_quaternion,
 )
 
-from .homography import (
-    compute_homography_ground_plane,
-    compute_homography_from_transform,
-    extract_R_T_from_transform,
-)
-
-from .bev_to_camera_warp import (
-    warp_bev_to_camera,
-    warp_bev_to_camera_with_coords,
-)
-
-from .camera_to_sat_projection import (
-    project_camera_to_satellite,
-)
-
-from .differentiable_projection import (
-    differentiable_camera_to_sat_warp,
-)
-
-from .pose_loss import (
-    PoseLoss,
-)
-
-# New: camera-to-camera ground-plane warp for pseudo-GT
-from .camera_to_camera_ground import (
-    camera_to_camera_groundplane_pull,
-    apply_yaw_rotation_to_pose,
-)
-
 __all__ = [
     # KITTI transforms
     'load_kitti_calib',
@@ -64,19 +39,4 @@ __all__ = [
     'PoseEncoder',
     'rotation_matrix_to_6d',
     'rotation_matrix_to_quaternion',
-    # Homography
-    'compute_homography_ground_plane',
-    'compute_homography_from_transform',
-    'extract_R_T_from_transform',
-    # BEV to camera warp
-    'warp_bev_to_camera',
-    'warp_bev_to_camera_with_coords',
-    # Camera to satellite projection
-    'project_camera_to_satellite',
-    'differentiable_camera_to_sat_warp',
-    # Pose loss
-    'PoseLoss',
-    # Camera-to-camera ground-plane
-    'camera_to_camera_groundplane_pull',
-    'apply_yaw_rotation_to_pose',
 ]

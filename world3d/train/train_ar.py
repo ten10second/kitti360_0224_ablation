@@ -21,7 +21,7 @@ from world3d.train.trainer_ar import ArTrainer
 
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, default="configs/ar.yaml")
+    ap.add_argument("--config", type=str, default="configs/ar_vanilla.yaml")
 
     ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--out_dir", type=str, default=None)

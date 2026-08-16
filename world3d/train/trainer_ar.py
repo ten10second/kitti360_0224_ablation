@@ -66,14 +66,9 @@ def _top_k_sampling(logits: torch.Tensor, k: int = 50, temperature: float = 1.0)
     sampled_tokens = torch.gather(top_k_indices, -1, sampled_indices.unsqueeze(-1)).squeeze(-1)
     return sampled_tokens
 from world3d.io.kitti360d_dataloader import Kitti360dDataset
-from world3d.train.conditioning_ar import get_condition_scale_sizes, build_condition_tokens_with_coords
-from world3d.train.geometry_ar import compute_inverse_projection_view
 from world3d.train.pose_ar import build_pose_vec
-from world3d.data.ar_pipeline import compute_bev_visibility_mask
-from world3d.train.consistency_loss import compute_multi_view_consistency_loss
 from world3d.train.vis_utils import (
     plot_loss_curve,
-    render_bev_attn_heatmap,
     render_sat_with_frustum,
     save_samples_grid_step_debug,
 )
@@ -187,22 +182,13 @@ class ArTrainer:
             max_seq_len=self.seq_len,
             target_rows=self.target_rows,
             target_cols=self.target_cols,
-            semantic_dim=4,
-            fourier_freqs=self.cfg.fourier_freqs,
-            train_bev_encoder=self.cfg.train_bev_encoder,
-            no_bev_pretrain=self.cfg.no_bev_pretrain,
             pose_dim=13,
             use_pose_token=self.cfg.use_pose_token,
-            n_pose_queries=self.cfg.n_pose_queries,
-            mode=self.cfg.mode,
-            use_ipm_semantic=self.cfg.use_ipm_semantic,
-            hybrid_memory_source=self.cfg.hybrid_memory_source,
-            use_explicit_token_pos=self.cfg.use_explicit_token_pos,
+            mode="vanilla",  # direct/hybrid removed in the ICASSP27 refactor
         ).to(self.device)
         self.predictor.train()
 
         if self.is_main:
-            print(f"[Model] use_ipm_semantic={self.cfg.use_ipm_semantic}")
             print(f"[Model] use_pose_token={self.cfg.use_pose_token}")
 
         # Apply channels_last memory format if configured
@@ -244,11 +230,9 @@ class ArTrainer:
                 static_graph=getattr(self.cfg.dist, "static_graph", False),
             )
 
-        self.bev_encoder_module = get_model_attr(self.predictor, "bev_encoder")
-        self.bev_feature_dim = get_model_attr(self.predictor, "bev_feature_dim")
-
-        self.condition_scale_specs = get_condition_scale_sizes(self.target_rows, self.target_cols)
-        self.condition_scale_names = ["fine"]
+        # SatMAE/BEV encoder removed from the main path (kept on disk as the
+        # future --sat_encoder satmae ablation branch).
+        self.bev_feature_dim = 256  # legacy collate plumbing expects this attr
 
     def _build_optim(self):
         self.optim = torch.optim.AdamW(
@@ -302,23 +286,7 @@ class ArTrainer:
         ckpt = torch.load(self.cfg.resume_ckpt, map_location=self.device)
 
         predictor_module = self.predictor.module if self.world_size > 1 else self.predictor
-        try:
-            predictor_module.load_state_dict(ckpt["model"], strict=True)
-        except RuntimeError as err:
-            missing_anchor_gate = {
-                "anchor_condition_gate.weight",
-                "anchor_condition_gate.bias",
-            }
-            load_result = predictor_module.load_state_dict(ckpt["model"], strict=False)
-            missing_keys = set(load_result.missing_keys)
-            unexpected_keys = set(load_result.unexpected_keys)
-            if unexpected_keys or (missing_keys - missing_anchor_gate):
-                raise err
-            if self.is_main:
-                print(
-                    "[Resume] Checkpoint predates anchor condition gate; "
-                    "using freshly initialized gate parameters."
-                )
+        predictor_module.load_state_dict(ckpt["model"], strict=True)
 
         if "optimizer" in ckpt:
             try:
@@ -631,56 +599,8 @@ class ArTrainer:
             predictor_module = self.predictor.module if hasattr(self.predictor, "module") else self.predictor
             input_tokens_batch, target_tokens_batch = predictor_module.make_teacher_forcing(idx_grid, bos_token=self.cfg.bos_token)
 
-            # 4. Batch geometric projection (IPM image disabled when semantic conditioning is off)
-            use_ipm_image = bool(getattr(self.cfg, "use_ipm_semantic", False))
-            warped_front_batch = []
-            warped_valid_batch = []
-            warped_coords_batch = []
-
+            # 4. Batch pose vector construction
             B = rgb_batch.size(0)
-            for b in range(B):
-                warped_front, warped_valid, warped_coords = compute_inverse_projection_view(
-                    sat_tensor=sat_tensor_batch[b],
-                    K=K_batch[b],
-                    T_cam_to_world=T_cam_to_world_batch[b],
-                    T_imu_to_world=T_imu_to_world_batch[b],
-                    target_h=self.target_h,
-                    target_w=self.target_w,
-                    device=self.device,
-                    return_ipm_image=use_ipm_image,
-                )
-                # 挤压掉批次维度，从 (1, C, H, W) 变为 (C, H, W)
-                warped_front_batch.append(warped_front.squeeze(0))
-                warped_valid_batch.append(warped_valid.squeeze(0))
-                warped_coords_batch.append(warped_coords.squeeze(0))
-
-            warped_front_batch = torch.stack(warped_front_batch, dim=0)
-            warped_valid_batch = torch.stack(warped_valid_batch, dim=0)
-            warped_coords_batch = torch.stack(warped_coords_batch, dim=0)
-
-            # 添加到 batch['vis'] 字典中，用于可视化
-            if use_ipm_image:
-                batch['vis']['ipm'] = warped_front_batch
-                batch['vis']['ipm_valid'] = warped_valid_batch
-            else:
-                batch['vis'].pop('ipm', None)
-                batch['vis'].pop('ipm_valid', None)
-
-            # 5. Batch condition token building
-            semantic_tokens_batch = {}
-            coord_tokens_batch = {}
-            semantic_tokens, coord_tokens = build_condition_tokens_with_coords(
-                warped_front_batch,
-                warped_coords_batch,
-                warped_valid_batch,
-                self.target_rows,
-                self.target_cols,
-                self.device,
-            )
-            semantic_tokens_batch["fine"] = semantic_tokens["fine"]
-            coord_tokens_batch["fine"] = coord_tokens["fine"]
-
-            # 6. Batch pose vector construction
             pose_batch = []
             for b in range(B):
                 pv = build_pose_vec(
@@ -694,26 +614,7 @@ class ArTrainer:
                 pose_batch.append(pv)
             pose_batch = torch.stack(pose_batch, dim=0)
 
-            # 7. Batch BEV encoding
-            # DDP fix: BEV encoder参数需要参与计算图，即使 requires_grad=False
-            # 移除 torch.no_grad() 上下文，让 frozen params 也能被 DDP reducer 追踪
-            bev_feats_input = self.bev_encoder_module(sat_tensor_batch)
-
-            # 8. Batch BEV visibility mask computation
-            bev_vis_mask = []
-            for b in range(B):
-                mask = compute_bev_visibility_mask(
-                    K=K_batch[b],
-                    T_cam_to_world=T_cam_to_world_batch[b],
-                    T_imu_to_world=T_imu_to_world_batch[b],
-                    bev_size=64,
-                    cam_h=self.target_h,
-                    cam_w=self.target_w,
-                )
-                bev_vis_mask.append(mask)
-            bev_vis_mask = torch.stack(bev_vis_mask, dim=0)
-
-            # 9. Supervision validity mask
+            # 6. Supervision validity mask
             supervision_valid_batch = torch.ones(B, self.target_rows, self.target_cols, device=self.device)
 
             if input_tokens_batch.size(0) == 0:
@@ -722,20 +623,13 @@ class ArTrainer:
                 continue
 
             condition_tokens_input = {
-                "coords": coord_tokens_batch["fine"],
                 "pose": pose_batch,
-                "K": K_batch,
-                "T_cam_to_world": T_cam_to_world_batch,
             }
-            if self.cfg.use_ipm_semantic:
-                condition_tokens_input["semantic"] = semantic_tokens_batch["fine"]
 
             with torch.amp.autocast('cuda', enabled=self.use_amp, dtype=torch.float16):
                 logits = self.predictor(
                     generated_tokens=input_tokens_batch.view(input_tokens_batch.size(0), -1),
                     condition_tokens=condition_tokens_input,
-                    aligned_bev_feature_map=bev_feats_input,
-                    bev_vis_mask=bev_vis_mask,
                 )
 
                 ce_per_token = F.cross_entropy(
@@ -750,73 +644,12 @@ class ArTrainer:
                 ce_loss = (ce_per_token * sup_valid).sum() / denom
                 total_loss = self.cfg.ce_weight * ce_loss
 
-                # Multi-view consistency loss (direct mode only)
-                consistency_loss = torch.tensor(0.0, device=self.device)
-                consistency_cosine_loss = torch.tensor(0.0, device=self.device)
-                consistency_nce_loss = torch.tensor(0.0, device=self.device)
-                consistency_matched_pairs = torch.tensor(0.0, device=self.device)
-                consistency_valid_view_pairs = torch.tensor(0.0, device=self.device)
-                consistency_overlap_ratio = torch.tensor(0.0, device=self.device)
-                consistency_nce_weight = 0.0
-                if getattr(self.cfg, "use_consistency_loss", False):
-                    predictor_module = self.predictor.module if hasattr(self.predictor, "module") else self.predictor
-                    consistency_rel_step = max(0, int(step) - int(self.start_step))
-                    consistency_nce_weight_max = float(getattr(self.cfg, "consistency_nce_weight_max", 0.1))
-                    consistency_nce_ramp_start = int(getattr(self.cfg, "consistency_nce_ramp_start", 10000))
-                    consistency_nce_ramp_end = int(getattr(self.cfg, "consistency_nce_ramp_end", 20000))
-                    if consistency_rel_step < consistency_nce_ramp_start:
-                        consistency_nce_weight = 0.0
-                    elif consistency_rel_step >= consistency_nce_ramp_end:
-                        consistency_nce_weight = consistency_nce_weight_max
-                    else:
-                        ramp_span = max(1, consistency_nce_ramp_end - consistency_nce_ramp_start)
-                        ramp_ratio = float(consistency_rel_step - consistency_nce_ramp_start) / float(ramp_span)
-                        consistency_nce_weight = consistency_nce_weight_max * ramp_ratio
-
-                    # Get intermediate features from model
-                    sampled_bev_feat = getattr(predictor_module, "last_sampled_bev_feat", None)
-                    semantic_feat = getattr(predictor_module, "last_semantic_feat", None)
-                    coords_map = getattr(predictor_module, "last_coords_map", None)
-                    consistency_overlap_mask = F.adaptive_avg_pool2d(
-                        warped_valid_batch.float(),
-                        (self.target_rows, self.target_cols),
-                    ) > 0.2
-
-                    if sampled_bev_feat is not None and coords_map is not None:
-                        consistency_dict = compute_multi_view_consistency_loss(
-                            sampled_bev_feat=sampled_bev_feat,
-                            semantic_feat=semantic_feat,
-                            coords_map=coords_map,
-                            frame_ids=batch.get('frame_id'),
-                            view_indices=batch.get('view_index'),
-                            overlap_mask=consistency_overlap_mask,
-                            temperature=getattr(self.cfg, "consistency_temperature", 0.5),
-                            use_semantic=False,  # Use BEV feature consistency by default
-                            use_cosine=bool(getattr(self.cfg, "consistency_use_cosine", True)),
-                            nce_weight=consistency_nce_weight,
-                        )
-                        consistency_loss = consistency_dict["loss"]
-                        consistency_cosine_loss = consistency_dict["cosine_loss"]
-                        consistency_nce_loss = consistency_dict["nce_loss"]
-                        consistency_matched_pairs = consistency_dict["matched_pairs"]
-                        consistency_valid_view_pairs = consistency_dict["valid_view_pairs"]
-                        consistency_overlap_ratio = consistency_dict["overlap_ratio"]
-                        total_loss = total_loss + getattr(self.cfg, "consistency_weight", 0.1) * consistency_loss
-
             if self.is_main:
                 ce_val = float(ce_loss.item())
-                consistency_val = float(consistency_loss.item()) if torch.is_tensor(consistency_loss) else float(consistency_loss)
                 self.loss_history.append((
                     step,
                     float(total_loss.item()),
                     ce_val,
-                    consistency_val,
-                    float(consistency_cosine_loss.item()),
-                    float(consistency_nce_loss.item()),
-                    float(consistency_nce_weight),
-                    float(consistency_matched_pairs.item()),
-                    float(consistency_valid_view_pairs.item()),
-                    float(consistency_overlap_ratio.item()),
                 ))
 
             accum_steps = max(1, int(self.cfg.accum_steps))
@@ -853,12 +686,6 @@ class ArTrainer:
                 mem_peak = torch.cuda.max_memory_allocated() / 1024**3
 
                 msg = f"[Step {step}] CE Loss: {ce_loss.item():.4f}"
-                if consistency_loss > 0.0001:
-                    msg += f" | Consistency Loss: {consistency_loss.item():.4f}"
-                    msg += f" (cos={consistency_cosine_loss.item():.4f}, nce={consistency_nce_loss.item():.4f}, nce_w={consistency_nce_weight:.3f})"
-                    msg += f" | Match={int(consistency_matched_pairs.item())}"
-                    msg += f" | Pair={int(consistency_valid_view_pairs.item())}"
-                    msg += f" | Overlap={consistency_overlap_ratio.item():.3f}"
                 msg += f" | Total: {total_loss.item():.4f}"
                 if self.scheduler is not None:
                     try:
@@ -905,18 +732,6 @@ class ArTrainer:
 
                     inverse_proj_vis = None
                     inverse_valid_mask_vis = None
-                    if bool(getattr(self.cfg, "use_ipm_semantic", False)):
-                        inverse_proj_vis = vis_data.get("ipm")
-                        if inverse_proj_vis is not None and torch.is_tensor(inverse_proj_vis) and inverse_proj_vis.numel() > 0:
-                            inverse_proj_vis = inverse_proj_vis[0]  # Take first sample
-                        else:
-                            inverse_proj_vis = None
-
-                        inverse_valid_mask_vis = vis_data.get("ipm_valid")
-                        if inverse_valid_mask_vis is not None and torch.is_tensor(inverse_valid_mask_vis) and inverse_valid_mask_vis.numel() > 0:
-                            inverse_valid_mask_vis = inverse_valid_mask_vis[0]  # Take first sample
-                        else:
-                            inverse_valid_mask_vis = None
 
                     with torch.no_grad():
                         # Get VQ reconstruction from ground truth tokens
@@ -934,45 +749,8 @@ class ArTrainer:
                         gen_decoded = self.vq.decode(pred_grid)  # (1, 3, H, W) in [-1, 1]
                         generated_vis = gen_decoded[0]  # (3, H, W)
 
-                    # --- BEV Attention Heatmap ---
-                    bev_attn_heatmap_vis = None
-                    sat_frustum_vis = None
-                    try:
-                        predictor_module = self.predictor.module if hasattr(self.predictor, "module") else self.predictor
-                        attn_source = getattr(predictor_module, "pose_aware_anchor_query", None)
-                        attn_weights = None
-                        if attn_source is not None:
-                            attn_weights = getattr(attn_source, "_last_cross_attn_weights", None)
-
-                        if attn_source is not None and attn_weights is not None:
-                            # Use first sample in batch
-                            if attn_weights.dim() >= 3:
-                                aw_np = attn_weights[0].detach().cpu().numpy()
-                            else:
-                                aw_np = attn_weights.detach().cpu().numpy()
-
-                            anchor_pts_np = None
-                            if hasattr(attn_source, "_last_anchors") and getattr(attn_source, "_last_anchors", None) is not None:
-                                anchor_pts_np = attn_source._last_anchors[0].detach().cpu().numpy()
-                            else:
-                                anchor_cache = getattr(attn_source, "_last_anchor_positions", None)
-                                if anchor_cache is not None:
-                                    anchor_pts_np = anchor_cache[0].detach().cpu().numpy()
-
-                            sat_vis = vis_data.get("sat")
-                            sat_bg = None
-                            if sat_vis is not None and torch.is_tensor(sat_vis) and sat_vis.numel() > 0:
-                                sat_t = sat_vis[0]  # (3, H, W) in [0,1]
-                                if sat_t.dim() == 3 and sat_t.shape[0] == 3:
-                                    sat_t = sat_t.permute(1, 2, 0)
-                                sat_bg = (sat_t.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                            bev_attn_heatmap_vis = render_bev_attn_heatmap(
-                                aw_np, sat_img=sat_bg, anchor_points=anchor_pts_np,
-                            )
-                    except Exception as e_attn:
-                        print(f"[Vis] BEV attention heatmap failed: {e_attn}")
-
                     # --- Satellite + FOV Frustum ---
+                    sat_frustum_vis = None
                     try:
                         sat_vis = vis_data.get("sat")
                         T_cam_vis = vis_data.get("T_cam_to_world")
@@ -1004,7 +782,6 @@ class ArTrainer:
                         inverse_valid_mask_vis=inverse_valid_mask_vis,
                         vq_recon_vis=vq_recon_vis,
                         generated_vis=generated_vis,
-                        bev_attn_heatmap_vis=bev_attn_heatmap_vis,
                         sat_frustum_vis=sat_frustum_vis,
                         is_main=True,
                         subdir="samples",

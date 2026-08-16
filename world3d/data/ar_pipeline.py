@@ -9,11 +9,9 @@ import torch
 
 from world3d.data.deterministic import make_rng
 from world3d.io.kitti360d_dataloader import _sample_random_signed_yaw
-from world3d.train.conditioning_ar import build_condition_tokens_with_coords
-from world3d.train.geometry_ar import compute_inverse_projection_view
 from world3d.train.pose_ar import build_pose_vec
 
-IMU_TO_GROUND_HEIGHT = 0.93  # consistent with bev_to_camera_warp.py
+IMU_TO_GROUND_HEIGHT = 0.93
 
 
 def compute_bev_visibility_mask(
@@ -26,67 +24,35 @@ def compute_bev_visibility_mask(
     cam_h: int = 256,
     cam_w: int = 640,
 ) -> torch.Tensor:
-    """Compute which BEV cells are visible from the camera's FOV.
+    """Project the BEV grid to the camera plane; 1 where visible.
 
-    Forward-projects the 64x64 BEV grid to the camera image plane.
-    A cell is visible if z_cam > 0 and the projected pixel is within image bounds.
-
-    Args:
-        K: (3,3) camera intrinsics
-        T_cam_to_world: (4,4) camera-to-world transform
-        T_imu_to_world: (4,4) IMU-to-world transform
-        bev_size: BEV grid size (default 64)
-        sat_pixels: satellite image pixel size (default 512)
-        sat_resolution: meters per satellite pixel (default 0.2)
-        cam_h: camera image height in pixels
-        cam_w: camera image width in pixels
-
-    Returns:
-        mask: (1, bev_size, bev_size) binary float tensor
+    Self-contained projection helper (no dependency on the deleted BEV warp
+    path); still used by the diffusion branch (world3d/data/diffusion_pipeline).
     """
     device = K.device
-    scale = sat_pixels / bev_size  # 8.0 for 512/64
-
-    # BEV cell centers in satellite pixel coords
+    scale = sat_pixels / bev_size
     cell_idx = torch.arange(bev_size, device=device, dtype=torch.float32)
-    cell_centers = cell_idx * scale + scale / 2.0  # [4, 12, 20, ..., 508]
-
-    # Meshgrid: v_sat = row (top-to-bottom), u_sat = col (left-to-right)
-    v_sat, u_sat = torch.meshgrid(cell_centers, cell_centers, indexing='ij')  # (64, 64)
-
-    # Satellite pixel → world coords (satellite is north-up, centered at IMU)
+    cell_centers = cell_idx * scale + scale / 2.0
+    v_sat, u_sat = torch.meshgrid(cell_centers, cell_centers, indexing='ij')
     imu_x = T_imu_to_world[0, 3]
     imu_y = T_imu_to_world[1, 3]
-    half_pix = sat_pixels / 2.0  # 256.0
-
+    half_pix = sat_pixels / 2.0
     X_world = imu_x + (u_sat - half_pix) * sat_resolution
     Y_world = imu_y - (v_sat - half_pix) * sat_resolution
     Z_world = T_imu_to_world[2, 3] - IMU_TO_GROUND_HEIGHT
-
     ones = torch.ones_like(X_world)
-    pts_world = torch.stack([X_world, Y_world, ones * Z_world, ones], dim=-1)  # (64, 64, 4)
-
-    # World → camera
-    T_world_to_cam = torch.inverse(T_cam_to_world)  # (4, 4)
-    pts_cam = (T_world_to_cam @ pts_world.reshape(-1, 4).T).T  # (4096, 4)
-    pts_cam = pts_cam.reshape(bev_size, bev_size, 4)
-
-    x_cam = pts_cam[..., 0]
-    y_cam = pts_cam[..., 1]
-    z_cam = pts_cam[..., 2]
-
-    # Project to image plane
+    pts_world = torch.stack([X_world, Y_world, ones * Z_world, ones], dim=-1)
+    T_world_to_cam = torch.inverse(T_cam_to_world)
+    pts_cam = (T_world_to_cam @ pts_world.reshape(-1, 4).T).T.reshape(bev_size, bev_size, 4)
+    x_cam, y_cam, z_cam = pts_cam[..., 0], pts_cam[..., 1], pts_cam[..., 2]
     u_pix = K[0, 0] * x_cam / z_cam + K[0, 2]
     v_pix = K[1, 1] * y_cam / z_cam + K[1, 2]
-
-    # Visibility: in front of camera AND within image bounds
     visible = (
         (z_cam > 0.1)
         & (u_pix >= 0) & (u_pix < cam_w)
         & (v_pix >= 0) & (v_pix < cam_h)
     )
-
-    return visible.float().unsqueeze(0)  # (1, 64, 64)
+    return visible.float().unsqueeze(0)
 
 
 @dataclass
