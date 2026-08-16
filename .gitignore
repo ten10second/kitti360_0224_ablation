@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+runs/
+ckpts/
+debug_output/
+*.pth
+*.bin

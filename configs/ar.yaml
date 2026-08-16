@@ -1,0 +1,121 @@
+# Full multi-drive AR training config with latent-space BEV consistency loss
+device: cuda
+
+# Data - Multi-drive configuration
+data_root: "/media/zhimiao/Lenovo/KITTI-360"
+# List of drives to use for training (using pre-split train frames)
+drives:
+  - name: "2013_05_28_drive_0000_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0002_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0003_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0005_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0006_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0007_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0009_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0010_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+
+# Reproducibility
+seed: 42
+data_seed: 42
+deterministic_data: true
+shuffle: true  # Shuffle across all drives
+subset: null
+
+# View configuration
+p_front: 0.6
+yaw_min_abs: 0.0
+yaw_max_abs: 40.0
+use_fixed_five_views: true
+fixed_view_turn_deg: 30.0
+fourier_freqs: 10
+
+# Performance optimization parameters
+perf:
+  enable_tf32: true
+  enable_sdpa: true
+  channels_last: false
+  torch_compile: false
+
+# DataLoader optimization
+loader:
+  num_workers: 8
+  prefetch_factor: 2
+  persistent_workers: true
+
+# DDP optimization
+dist:
+  find_unused_parameters: false
+  static_graph: false
+
+# Pair consistency optimization
+pair_sat_size: 256
+pair_max_pairs_per_frame: 2
+min_overlap_pixels: 200
+
+# DDP / DataLoader (backward compatibility)
+num_workers: 4
+ddp_strict_view: true
+full_determinism: false
+virtual_hfov: 80.0
+virtual_w: 640
+virtual_h: 256
+
+# Model architecture
+ntp_order: "topleft"
+train_bev_encoder: false
+no_bev_pretrain: false
+d_model: 512
+nhead: 8
+num_layers: 8
+grid_cols: 40
+grid_rows: 16
+bos_token: 1024
+n_pose_queries: 64
+
+# Training
+steps: 80000
+batch_size: 20
+accum_steps: 2
+lr: 1.0e-4
+weight_decay: 0.01
+grad_clip: 1.0
+use_warmup_cosine: true
+warmup_updates: 4000
+min_lr: 1.0e-6
+label_smoothing: 0.0
+ce_weight: 1.0
+
+# BEV Pair Consistency Loss (latent-space version) - Disabled
+use_pair_consistency: false
+pair_weight: 0.1
+pair_temperature: 1.0
+
+# Checkpointing & Logging
+out_dir: "runs/ar_multidrive_latent"
+print_every: 100
+save_every: 5000
+vis_every: 500
+plot_every: 100
+
+# Sampling & Visualization
+vis_top_k: 50
+vis_temperature: 0.9
+
+# Paths
+vq_ckpt: "ckpts/maskgit-vqgan-imagenet-f16-256.bin"

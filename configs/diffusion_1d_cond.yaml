@@ -1,0 +1,105 @@
+device: cuda
+data_root: "/media/zhimiao/Lenovo/KITTI-360"
+
+# Data - Multi-drive configuration (same as AR model for consistency)
+drives:
+  - name: "2013_05_28_drive_0000_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0002_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0003_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0005_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0006_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0007_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0009_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0010_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+
+# 模型配置
+model:
+  sd_model_id: "runwayml/stable-diffusion-v1-5"
+  controlnet_type: "custom"  # 我们自己训练的 ControlNet
+  pose_encoding_type: "6d"   # 与现有系统一致
+  pose_embed_dim: 768         # 与 SD Text Embedding 维度一致
+  use_existing_bev_encoder: true  # 复用 AR 模型的预训练 BEV 编码器
+  bev_encoder_ckpt: "ckpts/fmow_pretrain.pth"  # 预训练 MultiScaleViTBEVEncoder 模型
+  freeze_sd: true             # 冻结 SD 权重
+  freeze_bev_encoder: true   # 冻结 BEV 编码器
+
+# 训练配置
+steps: 80000
+batch_size: 4
+lr: 1.0e-4
+weight_decay: 0.01
+grad_clip: 1.0
+use_warmup_cosine: true
+warmup_updates: 4000
+min_lr: 1.0e-6
+
+# 视图配置
+use_fixed_five_views: true
+fixed_view_turn_deg: 30.0
+p_front: 0.6
+yaw_min_abs: 0.0
+yaw_max_abs: 40.0
+fourier_freqs: 10
+
+# Performance optimization parameters
+perf:
+  enable_tf32: true
+  enable_sdpa: true
+  channels_last: false
+  torch_compile: false
+
+# DataLoader optimization
+loader:
+  num_workers: 8
+  prefetch_factor: 2
+  persistent_workers: true
+
+# DDP optimization
+dist:
+  find_unused_parameters: true
+  static_graph: false
+
+# Pair consistency optimization
+pair_sat_size: 256
+pair_max_pairs_per_frame: 2
+min_overlap_pixels: 200
+
+# DDP / DataLoader (backward compatibility)
+num_workers: 8
+ddp_strict_view: true
+full_determinism: false
+virtual_hfov: 80.0
+virtual_w: 640
+virtual_h: 256
+
+# Checkpointing & Logging
+out_dir: "runs/diffusion_1d_cond"
+print_every: 100
+save_every: 5000
+vis_every: 1000
+plot_every: 100
+
+# Sampling & Visualization
+vis_top_k: 50
+vis_temperature: 0.9
+
+# Evaluation
+eval_every: 5000
+eval_batch_size: 4
+eval_num_samples: 1000

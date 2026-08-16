@@ -1,0 +1,145 @@
+# Stage2 anchor-view conditioned training
+# This config resumes from the hybrid baseline and enables reference-view conditioning
+
+device: cuda
+
+# Model mode must stay aligned with the resumed baseline checkpoint
+mode: "hybrid"
+
+# Data - Multi-drive configuration
+data_root: "/media/user/574b4a05-57d2-424d-bb82-763098cbf0a4/shizhm/KITTI-360"
+# List of drives to use for training (using pre-split train frames)
+drives:
+  - name: "2013_05_28_drive_0000_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0002_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0003_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0005_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0006_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0007_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0009_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0010_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+
+# Reproducibility
+seed: 42
+data_seed: 42
+deterministic_data: true
+shuffle: true
+subset: null
+
+# View configuration (fixed five views)
+use_fixed_five_views: true
+fixed_view_turn_deg: 30.0
+fourier_freqs: 10
+
+# Performance optimization parameters
+perf:
+  enable_tf32: true
+  enable_sdpa: true
+  channels_last: false
+  torch_compile: false
+
+# DataLoader optimization
+loader:
+  num_workers: 8
+  prefetch_factor: 2
+  persistent_workers: true
+
+# DDP optimization
+dist:
+  find_unused_parameters: true  # Anchor mode has additional parameters
+  static_graph: false
+
+# DDP / DataLoader (backward compatibility)
+num_workers: 4
+ddp_strict_view: true
+full_determinism: false
+virtual_hfov: 80.0
+virtual_w: 640
+virtual_h: 256
+
+# Model architecture (must match pretrained checkpoint)
+ntp_order: "topleft"
+train_bev_encoder: false
+no_bev_pretrain: true
+d_model: 512
+nhead: 8
+num_layers: 8
+grid_cols: 40
+grid_rows: 16
+bos_token: 1024
+n_pose_queries: 64
+
+# Training
+steps: 80000
+batch_size: 10
+accum_steps: 2
+lr: 2.0e-5
+weight_decay: 0.01
+grad_clip: 1.0
+use_warmup_cosine: true
+warmup_updates: 800
+min_lr: 1.0e-6
+label_smoothing: 0.0
+ce_weight: 1.0
+
+# Multi-view semantic consistency loss (disabled in this stage2 setup)
+use_consistency_loss: false
+consistency_weight: 0.1
+consistency_temperature: 0.5
+
+# Anchor-view conditional training (Stage 2, first batch: target conditional CE only)
+use_anchor_view_training: true
+anchor_view_source: "generated"
+use_ipm_semantic: false
+anchor_view_use_consistency: false
+anchor_view_consistency_weight: 0.05
+anchor_view_ce_weight: 1.0
+anchor_view_baseline_ce_weight: 0.3
+anchor_feature_loss_weight: 1.0
+anchor_consistency_temperature: 0.5
+anchor_distance_threshold: 0.05
+anchor_view_top_k: 1
+anchor_view_temperature: 1.0
+anchor_view_dropout_prob: 0.3
+anchor_view_cache_dir: "runs/ar_anchor_view_stage2/anchor_cache"
+anchor_view_mem_cache_size: 2048
+anchor_view_cache_only: true
+
+# MaskGIT (Reflow-like generation)
+maskgit_mode: true
+maskgit_num_steps: 12
+maskgit_temperature: 1.0
+maskgit_top_k: 50
+
+# Checkpointing & Logging
+out_dir: "runs/ar_anchor_view_stage2"
+print_every: 200
+save_every: 5000
+vis_every: 1000
+plot_every: 200
+
+# Resume from hybrid baseline checkpoint
+resume_ckpt: "runs/ar_hybrid/ckpt_step_0050000.pt"
+
+# Sampling & Visualization
+vis_top_k: 50
+vis_temperature: 0.9
+
+# Paths
+vq_ckpt: "ckpts/maskgit-vqgan-imagenet-f16-256.bin"

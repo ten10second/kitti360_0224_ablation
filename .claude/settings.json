@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 scripts/infer_yaw_sweep.py --mode 360sweep --drive 2013_05_28_drive_0000_sync --sweep-frame 10927 --sweep-interval 20)",
+      "Bash(conda init bash)",
+      "Bash(~/miniconda3/envs/maskgit/bin/python scripts/infer_yaw_sweep.py --mode 360sweep --drive 2013_05_28_drive_0000_sync --sweep-frame 10927 --sweep-interval 20)",
+      "Read(//home/zhimiao/miniconda3/envs/**)",
+      "Read(//home/zhimiao/miniconda3/**)",
+      "Bash(/home/zhimiao/.conda/envs/maskgit/bin/python scripts/infer_yaw_sweep.py --mode 360sweep --drive 2013_05_28_drive_0000_sync --sweep-frame 10927 --sweep-interval 20)",
+      "WebFetch(domain:github.com)",
+      "Bash(pip install pytorch-fid)",
+      "Bash(/home/zhimiao/.conda/envs/maskgit/bin/pip install pytorch-fid)",
+      "Bash(/home/zhimiao/.conda/envs/maskgit/bin/python /media/zhimiao/Lenovo/kitti360_camera_pose_clean_0224/scripts/evaluate_metrics.py --help)",
+      "Bash(/home/zhimiao/.conda/envs/maskgit/bin/python /media/zhimiao/Lenovo/kitti360_camera_pose_clean_0224/scripts/evaluate_metrics.py)",
+      "Bash(pkill -f evaluate_metrics.py)",
+      "Bash(/home/zhimiao/.conda/envs/maskgit/bin/python /media/zhimiao/Lenovo/kitti360_camera_pose_clean_0224/scripts/test_single_frame_visualization.py)",
+      "Bash(/home/zhimiao/.conda/envs/maskgit/bin/python /media/zhimiao/Lenovo/kitti360_camera_pose_clean_0224/scripts/test_single_frame_visualization.py --drive 2013_05_28_drive_0003_sync --frame-id 978)",
+      "Bash(python3 -m venv venv)",
+      "Bash(pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu)",
+      "Bash(python3 scripts/test_single_frame_visualization.py)",
+      "Bash(pkill -f \"python scripts/evaluate_metrics.py\")"
+    ],
+    "additionalDirectories": [
+      "/tmp"
+    ]
+  }
+}

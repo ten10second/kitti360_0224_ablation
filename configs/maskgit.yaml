@@ -1,0 +1,64 @@
+# MaskGIT training config (based on ar.yaml)
+device: cuda
+
+# Data
+data_root: "/media/shizhm/Lenovo/kitti360_camera_pose"
+drive: "2013_05_28_drive_0003_sync"
+p_front: 0.6
+yaw_min_abs: 0.0
+yaw_max_abs: 40.0
+# Test frames to exclude from training
+exclude_frames: [58, 113, 412, 536, 630, 756, 853, 897]
+
+# DDP / DataLoader
+num_workers: 0
+ddp_strict_view: true
+full_determinism: false
+virtual_hfov: 80.0
+virtual_w: 640
+virtual_h: 256
+
+# Model
+ntp_order: "topleft"
+train_bev_encoder: false
+no_bev_pretrain: false
+d_model: 512
+nhead: 8
+num_layers: 8
+grid_cols: 40
+grid_rows: 16
+bos_token: 1024
+n_pose_queries: 64
+
+# Training
+steps: 200000
+batch_size: 32
+accum_steps: 1
+lr: 1.0e-4
+weight_decay: 0.01
+grad_clip: 1.0
+use_warmup_cosine: false
+warmup_updates: 4000
+min_lr: 1.0e-6
+label_smoothing: 0.0
+ce_weight: 1.0
+
+# MaskGIT specific
+maskgit_mode: true
+maskgit_num_steps: 12
+maskgit_temperature: 1.0
+maskgit_top_k: 50
+
+# Checkpointing & Logging
+out_dir: "runs/maskgit_simplified_v2"
+print_every: 400
+save_every: 10000
+vis_every: 1000
+plot_every: 100
+
+# Sampling & Visualization
+vis_top_k: 50
+vis_temperature: 0.9
+
+# Paths
+vq_ckpt: "ckpts/maskgit-vqgan-imagenet-f16-256.bin"

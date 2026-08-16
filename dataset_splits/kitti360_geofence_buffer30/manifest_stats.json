@@ -1,0 +1,36 @@
+{
+ "buffer_m": 30.0,
+ "split_strategy": "remove_train_frames_within_world_buffer_of_test_route",
+ "test_drives": [
+  "2013_05_28_drive_0002_sync",
+  "2013_05_28_drive_0003_sync"
+ ],
+ "val_drives": [
+  "2013_05_28_drive_0007_sync"
+ ],
+ "train_drives_input": [
+  "2013_05_28_drive_0000_sync",
+  "2013_05_28_drive_0005_sync",
+  "2013_05_28_drive_0006_sync",
+  "2013_05_28_drive_0009_sync",
+  "2013_05_28_drive_0010_sync"
+ ],
+ "frame_source": "poses.txt (exact match) + satellite file present",
+ "num_train_input": 42261,
+ "num_train_kept": 42261,
+ "num_train_removed": 0,
+ "num_val_input": 2890,
+ "num_val_kept": 2890,
+ "num_val_removed": 0,
+ "num_test_input": 14678,
+ "num_test_kept": 14678,
+ "num_test_removed": 0,
+ "nearest_test_route_distance_m": {
+  "min": 1892.8938125378563,
+  "p01": 1968.8548117151145,
+  "p50": 3366.099297835394,
+  "max": 5349.285178682594
+ },
+ "drive_overlap_after_split": [],
+ "out_dir": "dataset_splits/kitti360_geofence_buffer30"
+}

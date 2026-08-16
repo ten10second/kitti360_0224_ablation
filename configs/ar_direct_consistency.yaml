@@ -1,0 +1,128 @@
+# Direct Geometric Mode with Multi-view Semantic Consistency Loss
+# This extends Direct mode with multi-view consistency loss for better semantic coherence
+device: cuda
+
+# Model mode: "vanilla" or "direct"
+mode: "direct"
+
+# Data - Multi-drive configuration
+data_root: "/media/user/574b4a05-57d2-424d-bb82-763098cbf0a4/shizhm/KITTI-360"
+# List of drives to use for training (using pre-split train frames)
+drives:
+  - name: "2013_05_28_drive_0000_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0002_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0003_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0005_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0006_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0007_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0009_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+  - name: "2013_05_28_drive_0010_sync"
+    frames_file: "train_frames.txt"
+    weight: 1.0
+
+# Reproducibility
+seed: 42
+data_seed: 42
+deterministic_data: true
+shuffle: true  # Shuffle across all drives
+subset: null
+
+# View configuration (fixed five views)
+use_fixed_five_views: true
+fixed_view_turn_deg: 30.0
+fourier_freqs: 10
+
+# Performance optimization parameters
+perf:
+  enable_tf32: true
+  enable_sdpa: true
+  channels_last: false
+  torch_compile: false
+
+# DataLoader optimization
+loader:
+  num_workers: 8
+  prefetch_factor: 2
+  persistent_workers: true
+
+# DDP optimization
+dist:
+  find_unused_parameters: true  # Direct mode has different parameter usage
+  static_graph: false
+
+# DDP / DataLoader (backward compatibility)
+num_workers: 4
+ddp_strict_view: true
+full_determinism: false
+virtual_hfov: 80.0
+virtual_w: 640
+virtual_h: 256
+
+# Model architecture
+ntp_order: "topleft"
+train_bev_encoder: false
+no_bev_pretrain: false
+use_ipm_semantic: false
+d_model: 512
+nhead: 8
+num_layers: 8
+grid_cols: 40
+grid_rows: 16
+bos_token: 1024
+n_pose_queries: 64
+
+# Training - Continue from 60k steps with consistency loss
+steps: 90000  # Continue training for 30k more steps (total 90k)
+batch_size: 10
+accum_steps: 1
+lr: 5.0e-5  # Reduced learning rate for fine-tuning
+weight_decay: 0.01
+grad_clip: 1.0
+use_warmup_cosine: true
+warmup_updates: 1000  # Shorter warmup for fine-tuning
+min_lr: 1.0e-6
+label_smoothing: 0.0
+ce_weight: 1.0
+
+# Multi-view semantic consistency loss (ENABLED for this configuration)
+use_consistency_loss: true
+consistency_weight: 0.3
+consistency_temperature: 0.5
+consistency_use_cosine: true
+consistency_nce_weight_max: 0.1
+consistency_nce_ramp_start: 10000
+consistency_nce_ramp_end: 20000
+
+# Checkpointing & Logging - Save to a new directory to avoid overwriting
+out_dir: "runs/ar_direct_consistency"
+print_every: 100
+save_every: 5000
+vis_every: 500
+plot_every: 100
+
+# Sampling & Visualization
+vis_top_k: 50
+vis_temperature: 0.9
+
+# MaskGIT (Reflow-like generation)
+maskgit_mode: false
+maskgit_num_steps: 12
+maskgit_temperature: 1.0
+maskgit_top_k: 50
+
+# Paths
+vq_ckpt: "ckpts/maskgit-vqgan-imagenet-f16-256.bin"
