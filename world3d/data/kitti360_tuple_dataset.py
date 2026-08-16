@@ -50,7 +50,7 @@ class TupleSpec:
     dist_m: float
     dyaw_deg: float
     window_center_fid: int
-    window_origin_xy: np.ndarray  # (2,) world coords of window center
+    window_origin_xyz: np.ndarray  # (3,) world coords of window center (translation-only window frame)
 
 
 class Kitti360TupleDataset(Dataset):
@@ -177,7 +177,7 @@ class Kitti360TupleDataset(Dataset):
                 Tc = T_imu.get(center_fid)
                 if Tc is None:
                     continue
-                origin_xy = np.array([Tc[0, 3], Tc[1, 3]])
+                origin_xyz = np.array([Tc[0, 3], Tc[1, 3], Tc[2, 3]])
                 # deterministic anchors within [w_start, w_end - (K-1)*spacing - dist_max]
                 a = w_start
                 while a <= w_end - (self.k_max - 1) * self.anchor_spacing_m - self.dist_max_m - 1e-6:
@@ -210,7 +210,7 @@ class Kitti360TupleDataset(Dataset):
                             dist_m=dist,
                             dyaw_deg=dyaw,
                             window_center_fid=center_fid,
-                            window_origin_xy=origin_xy,
+                            window_origin_xyz=origin_xyz,
                         ))
                     a += self.anchor_stride_m
         self.n_reject_yaw = n_reject_yaw
@@ -306,7 +306,7 @@ class Kitti360TupleDataset(Dataset):
 
         # window-local coords of satellite patch centers (for metric PE, computed here
         # as origin xy; the model derives per-patch world xy from origin + grid)
-        origin_xy = torch.from_numpy(spec.window_origin_xy.astype(np.float32))
+        origin_xyz = torch.from_numpy(spec.window_origin_xyz.astype(np.float32))
 
         pose_vec = build_pose_vec(
             torch.from_numpy(tgt_K.astype(np.float32)),
@@ -329,7 +329,7 @@ class Kitti360TupleDataset(Dataset):
             "rel_poses": torch.stack(rel_poses),
             "n_src": len(source_fids),
             "sat": sat_t,
-            "window_origin_xy": origin_xy,
+            "window_origin_xyz": origin_xyz,
             "sat_m_per_px": self.sat_m_per_px,
             "meta": {
                 "drive": spec.drive,
@@ -373,6 +373,6 @@ def collate_tuples(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "src_mask": src_mask,
         "n_src": torch.tensor([b["n_src"] for b in batch], dtype=torch.long),
         "sat": torch.stack([b["sat"] for b in batch]),
-        "window_origin_xy": torch.stack([b["window_origin_xy"] for b in batch]),
+        "window_origin_xyz": torch.stack([b["window_origin_xyz"] for b in batch]),
         "meta": [b["meta"] for b in batch],
     }

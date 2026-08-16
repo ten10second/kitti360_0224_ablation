@@ -141,3 +141,25 @@ git：快照 `a32d6a8`（改造前完整状态）→ 删除提交 `adf92fc`（**
 - `icassp27_verify/smoke_test.py`：数据集几何一致性（5 样本）、确定性、batch collate、模型 forward/backward、memory token 账目（1+1369+2×666=2702 精确）、B0/B1 开关、`generate()` —— **全部通过**。
 - 60 步真实训练：loss 7.03（warmup 中 lr 5e-6），无 NaN，0.5s/it。
 - 400 步趋势验证：`runs/icassp27_smoke400`（见 VERIFY_LOG 更新）。
+
+---
+
+## 8. 追加（2026-08-16 晚）：target raymap 条件化（geo 注入修正）
+
+**动机（架构审查发现的真实缺陷）**：e_pose 的 t_cam−t_imu 是 MM26"车心转 yaw"时代的安装偏移（~1m），不携带沿路线位置；source rel-pose 只有相对量；卫星 MetricPE 只标记卫星 token。三者组合对"整条 tuple 在 60m 窗口内平移"**不变**，而窗口共享同一张卫星 crop → B0 原理上无法知道目标在窗口哪里，B2 只能靠隐式地标匹配。这是与主流做法（LVSM/CameraCtrl 的 Plücker raymap；3DiM 的相对位姿 attention）对照后确认的设计缺口。
+
+**改动**（对照 ICASSP27 文档 §3.5/§7 的 geo 消融行，把已删除的 rayrope/ipm 替换为主流选项）：
+
+| 文件 | 改动 |
+|---|---|
+| `world3d/models/icassp27_predictor.py` | 新增 `TargetRayPE`（每 token 6 维 (o,d)→MLP→D，加到 target token 嵌入；BOS 位 PE 置零）；`_target_rays()`：o = 相机中心在**窗口局部系**的坐标（t_cam − origin_xyz），d = R·K⁻¹(u,v,1)/‖·‖（40×16 token 网格的像素中心）；`geo` 开关 `{raymap, pose_add, proj}`，默认 raymap，proj 为 PVSM 式占位 |
+| `world3d/data/kitti360_tuple_dataset.py` | `window_origin_xy`(2D) → `window_origin_xyz`(3D，窗口中心帧 IMU 全坐标)，collate 同步 |
+| `world3d/train/train_icassp27.py` + `configs/icassp27_pilot.yaml` | 传 `tgt_K`/`tgt_T_cam`/`window_origin_xyz`；配置 `model.geo: raymap` |
+| （顺手）`DinoV2Encoder` | hub 加载改为**缓存优先**（此前网络慢时 try 分支可挂起数分钟） |
+
+**为什么用窗口局部原点**：① 卫星 MetricPE 同为窗口系，query/key 同规范可直接互查（"我的射线打到卫星哪个 patch"）；② 避开 PVSM（CVPR 2026）指出的绝对世界 gauge 问题；③ 数值恒在 ±50m，对 MLP 友好。
+
+**验证**：
+- 平移不变性破坏测试：目标 +30m → ray 原点均值偏移 30.0m，ray PE 逐 token |diff| = 521（≫0）——B0 条件化不再平移不变 ✅
+- 冒烟全过（B0/B1×raymap、pose_add 消融行、generate）；30 步训练回归 OK（36.7M 可训练）
+- 400 步趋势（同 warmup=50 条件）：raymap 6.35→**6.44** vs pose_add **6.35**；400 步属 warmup 后极早期，不做优劣结论，仅确认可训练、无 NaN、吞吐持平（0.46 vs 0.46 s/it）。真正的 geo 消融判断留给正式 pilot。

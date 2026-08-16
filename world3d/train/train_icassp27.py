@@ -43,10 +43,12 @@ def decode_and_save(vq, model, batch, device, path: Path, max_show: int = 3):
             inp,
             batch["pose_vec"][:max_show].to(device),
             sat=batch["sat"][:max_show].to(device),
-            window_origin_xy=batch["window_origin_xy"][:max_show].to(device),
+            window_origin_xyz=batch["window_origin_xyz"][:max_show].to(device),
             src_rgbs=batch["src_rgbs"][:max_show].to(device),
             rel_poses=batch["rel_poses"][:max_show].to(device),
             src_mask=batch["src_mask"][:max_show].to(device),
+            tgt_K=batch["tgt_K"][:max_show].to(device),
+            tgt_T_cam=batch["tgt_T_cam"][:max_show].to(device),
         )
         pred = logits.argmax(-1)
         rec = vq.decode(pred).clamp(-1, 1)
@@ -124,6 +126,7 @@ def main():
         pose_dim=cfg.model.pose_dim,
         dino_arch=cfg.model.dino_arch,
         sat_encoder=cfg.model.sat_encoder,
+        geo=cfg.model.get("geo", "raymap"),
         use_sat=cfg.model.use_sat,
         use_src=cfg.model.use_src,
         fourier_freqs=cfg.model.fourier_freqs,
@@ -171,10 +174,12 @@ def main():
                 inp,
                 batch["pose_vec"].to(device, non_blocking=True),
                 sat=batch["sat"].to(device, non_blocking=True),
-                window_origin_xy=batch["window_origin_xy"].to(device, non_blocking=True),
+                window_origin_xyz=batch["window_origin_xyz"].to(device, non_blocking=True),
                 src_rgbs=batch["src_rgbs"].to(device, non_blocking=True),
                 rel_poses=batch["rel_poses"].to(device, non_blocking=True),
                 src_mask=batch["src_mask"].to(device, non_blocking=True),
+                tgt_K=batch["tgt_K"].to(device, non_blocking=True),
+                tgt_T_cam=batch["tgt_T_cam"].to(device, non_blocking=True),
             )
             loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), label.reshape(-1),
                                    label_smoothing=cfg.train.get("label_smoothing", 0.0))

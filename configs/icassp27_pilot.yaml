@@ -30,6 +30,7 @@ model:
   pose_dim: 13                # e_pose (kept pipeline)
   dino_arch: vitb14           # DINOv2 ViT-B/14 (official ckpt is patch-14)
   sat_encoder: dino           # "satmae" reserved as ablation branch
+  geo: raymap                 # raymap (per-token target rays, window-local origin; default) | pose_add (e_pose only, ablation) | proj (PVSM-style, placeholder)
   use_sat: true
   use_src: true
   fourier_freqs: 10           # metric PE (Fourier encoder kept from H_geo)

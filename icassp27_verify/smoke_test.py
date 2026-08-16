@@ -41,12 +41,13 @@ def main():
     batch = collate_tuples([ds[i] for i in range(4)])
     print(f"batch: tgt_rgb {tuple(batch['tgt_rgb'].shape)} src_rgbs {tuple(batch['src_rgbs'].shape)} "
           f"sat {tuple(batch['sat'].shape)} n_src {batch['n_src'].tolist()} mask {batch['src_mask'].sum(1).tolist()}")
+    print(f"window_origin_xyz: {batch['window_origin_xyz'][0].tolist()}")
 
     print("\n== model ==")
     dev = torch.device("cuda")
     model = ICASSP27Predictor(
         vocab_size=1024, d_model=256, nhead=8, num_layers=2, dim_feedforward=512,
-        max_seq_len=1080, dino_arch="vitb14",
+        max_seq_len=1080, dino_arch="vitb14", geo="raymap",
     ).to(dev)
     n_tr = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"trainable params: {n_tr/1e6:.2f}M")
@@ -54,11 +55,14 @@ def main():
     inp = torch.randint(0, 1024, (B, L), device=dev)
     pose = batch["pose_vec"].to(dev)
     sat = batch["sat"].to(dev)
-    origin = batch["window_origin_xy"].to(dev)
+    origin = batch["window_origin_xyz"].to(dev)
     src = batch["src_rgbs"].to(dev)
     rel = batch["rel_poses"].to(dev)
     mask = batch["src_mask"].to(dev)
-    logits = model(inp, pose, sat=sat, window_origin_xy=origin, src_rgbs=src, rel_poses=rel, src_mask=mask)
+    tK = batch["tgt_K"].to(dev)
+    tT = batch["tgt_T_cam"].to(dev)
+    logits = model(inp, pose, sat=sat, window_origin_xyz=origin, src_rgbs=src, rel_poses=rel,
+                   src_mask=mask, tgt_K=tK, tgt_T_cam=tT)
     print(f"logits: {tuple(logits.shape)}")
     assert logits.shape == (B, L, 1024)
     loss = torch.nn.functional.cross_entropy(logits.reshape(-1, 1024), inp.reshape(-1))
@@ -66,21 +70,40 @@ def main():
     gnorm = sum(p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None)
     print(f"loss {loss.item():.4f}  grad-mass {gnorm:.3f}  (grads flowing)")
 
+    # --- raymap semantics: translating the tuple within the window MUST change conditioning ---
+    tT2 = tT.clone(); tT2[:, 0, 3] += 30.0  # same window, target 30 m further east
+    o1, d1 = model._target_rays(tK, tT, origin)
+    o2, _ = model._target_rays(tK, tT2, origin)
+    ray_shift = (o2 - o1).norm(dim=-1).mean().item()
+    print(f"ray origin shift when target moves +30m in-window: {ray_shift:.1f} m (expect ~30)")
+    assert abs(ray_shift - 30.0) < 0.5
+    pe1 = model._token_ray_pe(tK, tT, origin, L)
+    pe2 = model._token_ray_pe(tK, tT2, origin, L)
+    pe_diff = (pe1 - pe2).abs().sum(-1)[:, 1:].mean().item()  # skip BOS position
+    print(f"ray PE per-token |diff| after +30m shift: {pe_diff:.3f} (expect >> 0; B0 no longer translation-invariant)")
+    assert pe_diff > 0.1
+
     # memory token accounting
     mem, pad = model.build_memory(pose, sat, origin, src, rel, mask)
     n_sat = model.sat_grid[0] * model.sat_grid[1]
     exp = 1 + n_sat + int(mask.shape[1]) * model.src_tokens_per_view
     print(f"memory: {tuple(mem.shape)} (expected {exp})  pad tokens {int(pad.sum())}")
 
-    # B0/B1 ablation switches
-    m0 = ICASSP27Predictor(d_model=128, num_layers=1, use_src=False).to(dev)
-    l0 = m0(inp, pose, sat=sat, window_origin_xy=origin)
-    m1 = ICASSP27Predictor(d_model=128, num_layers=1, use_sat=False).to(dev)
-    l1 = m1(inp, pose, src_rgbs=src, rel_poses=rel, src_mask=mask)
+    # B0/B1 ablation switches (B0 uses raymap -> position-aware even without sources)
+    m0 = ICASSP27Predictor(d_model=128, num_layers=1, use_src=False, geo="raymap").to(dev)
+    l0 = m0(inp, pose, sat=sat, window_origin_xyz=origin, tgt_K=tK, tgt_T_cam=tT)
+    m1 = ICASSP27Predictor(d_model=128, num_layers=1, use_sat=False, geo="raymap").to(dev)
+    l1 = m1(inp, pose, src_rgbs=src, rel_poses=rel, src_mask=mask, tgt_K=tK, tgt_T_cam=tT)
     print(f"B0 (sat-only) logits {tuple(l0.shape)}; B1 (src-only) logits {tuple(l1.shape)}")
 
+    # geo=pose_add ablation row (no ray inputs needed)
+    mp = ICASSP27Predictor(d_model=128, num_layers=1, geo="pose_add").to(dev)
+    lp = mp(inp, pose, sat=sat, window_origin_xyz=origin, src_rgbs=src, rel_poses=rel, src_mask=mask)
+    print(f"geo=pose_add logits {tuple(lp.shape)}")
+
     # generate smoke (few tokens)
-    gen = model.generate(pose, max_len=8, sat=sat, window_origin_xy=origin, src_rgbs=src, rel_poses=rel, src_mask=mask)
+    gen = model.generate(pose, max_len=8, sat=sat, window_origin_xyz=origin, src_rgbs=src, rel_poses=rel,
+                         src_mask=mask, tgt_K=tK, tgt_T_cam=tT)
     print(f"generate: {tuple(gen.shape)} values in [0,1024]: {bool((gen >= 0).all() and (gen < 1024).all())}")
     print("\nSMOKE TEST OK")
 

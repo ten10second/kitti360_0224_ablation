@@ -33,19 +33,26 @@ import torch.nn.functional as F
 from models.stage2.vanilla_components import VanillaPoseProjector
 
 
+def _load_dinov2(arch: str):
+    """Load DINOv2 from the local hub cache when available (avoids hanging on
+    flaky GitHub access); falls back to a normal hub.load otherwise."""
+    import torch.hub as hub
+    from pathlib import Path as _P
+
+    name = f"dinov2_{arch}"
+    repo_dir = _P(hub.get_dir()) / "facebookresearch_dinov2_main"
+    ckpt = _P(hub.get_dir()) / "checkpoints" / f"{name}_pretrain.pth"
+    if repo_dir.exists() and ckpt.exists():
+        return hub.load(str(repo_dir), name, pretrained=True, source="local")
+    return hub.load("facebookresearch/dinov2", name, pretrained=True)
+
+
 class DinoV2Encoder(nn.Module):
     """Frozen DINOv2 patch-token extractor (shared by sat & street branches)."""
 
     def __init__(self, arch: str = "vitb14"):
         super().__init__()
-        try:
-            self.backbone = torch.hub.load("facebookresearch/dinov2", f"dinov2_{arch}", pretrained=True)
-        except Exception:
-            # offline fallback: use the cached hub repo dir (weights already in TORCH_HOME/checkpoints)
-            import torch.hub as hub
-            from pathlib import Path as _P
-            cache_dir = _P(hub.get_dir()) / "facebookresearch_dinov2_main"
-            self.backbone = hub.load(str(cache_dir), f"dinov2_{arch}", pretrained=True, source="local")
+        self.backbone = _load_dinov2(arch)
         self.backbone.eval()
         for p in self.backbone.parameters():
             p.requires_grad = False
@@ -103,6 +110,29 @@ class RelPoseProjector(nn.Module):
         return self.mlp(dp)  # (B,K,D)
 
 
+class TargetRayPE(nn.Module):
+    """Per-token target-view ray embedding (geo=raymap, mainstream conditioning).
+
+    Each target token (40x16 grid) gets the 6-dim (o, d) of its pixel's camera
+    ray: origin o = camera center in the WINDOW-LOCAL frame (this is what makes
+    the absolute position within the shared satellite window observable), and
+    unit direction d = R @ K^-1 (u,v,1) / |.|. Encoded by a small MLP and added
+    to the token embedding — same injection pattern as MetricPE / RelPose.
+    """
+
+    def __init__(self, d_model: int, hidden: int = 256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(6, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, d_model),
+        )
+
+    def forward(self, o: torch.Tensor, d: torch.Tensor) -> torch.Tensor:
+        """o: (B,N,3) meters, d: (B,N,3) unit -> (B,N,d_model)."""
+        return self.mlp(torch.cat([o, d], dim=-1))
+
+
 class ICASSP27Predictor(nn.Module):
     def __init__(
         self,
@@ -117,17 +147,23 @@ class ICASSP27Predictor(nn.Module):
         pose_dim: int = 13,
         dino_arch: str = "vitb14",
         sat_encoder: str = "dino",       # "dino" | "satmae"
+        geo: str = "raymap",             # "raymap" (per-token target rays) | "pose_add" (e_pose only) | "proj" (PVSM-style, ablation placeholder)
         use_sat: bool = True,
         use_src: bool = True,
         fourier_freqs: int = 10,
         sat_px: int = 512,               # on-disk satellite size
         sat_m_per_px: float = 0.196,
         src_size: tuple = (640, 256),    # (W,H) of street images
+        target_rows: int = 16,
+        target_cols: int = 40,
     ):
         super().__init__()
         assert sat_encoder in ("dino", "satmae")
+        assert geo in ("raymap", "pose_add", "proj")
         if sat_encoder == "satmae":
             raise NotImplementedError("SatMAE ablation branch: wire models/multiscale_vit_encoder.py here")
+        if geo == "proj":
+            raise NotImplementedError("proj ablation row (PVSM-style source->target projection): not wired yet")
         assert use_sat or use_src, "B0/B1/B2 all need at least one condition branch"
 
         self.vocab_size = vocab_size
@@ -143,11 +179,16 @@ class ICASSP27Predictor(nn.Module):
         self.src_proj = nn.Linear(self.dino.dim, d_model)
         self.metric_pe = MetricPE(d_model, fourier_freqs)
         self.rel_pose = RelPoseProjector(d_model)
+        self.ray_pe = TargetRayPE(d_model)
         self.pose_proj = VanillaPoseProjector(pose_dim, d_model)  # e_pose reuse
+        self.geo = geo
+        self.target_rows = int(target_rows)
+        self.target_cols = int(target_cols)
 
         # DINOv2 input sizes (patch 14)
         self.dino_sat_size = (518, 518)
         self.dino_src_size = (518, 252)  # 640x256 -> (37, 18) patches
+        self.img_w, self.img_h = int(src_size[0]), int(src_size[1])
         self.sat_grid = (self.dino_sat_size[0] // self.dino.patch, self.dino_sat_size[1] // self.dino.patch)
         self.src_tokens_per_view = (self.dino_src_size[0] // self.dino.patch) * (self.dino_src_size[1] // self.dino.patch)
 
@@ -167,6 +208,37 @@ class ICASSP27Predictor(nn.Module):
         self.head = nn.Linear(d_model, vocab_size)
 
     # ------------------------------------------------------------- memory
+    # ------------------------------------------------------------ target rays
+    def _target_rays(self, tgt_K: torch.Tensor, tgt_T_cam: torch.Tensor, window_origin_xyz: torch.Tensor):
+        """(o, d) per target token. o = camera center in the window frame;
+        d = unit ray direction from intrinsics + camera rotation.
+        Returns two (B, rows*cols, 3) tensors in token raster order."""
+        B = tgt_K.shape[0]
+        dev = tgt_K.device
+        rows, cols = self.target_rows, self.target_cols
+        ph = self.img_h / rows
+        pw = self.img_w / cols
+        v = (torch.arange(rows, device=dev, dtype=torch.float32) + 0.5) * ph
+        u = (torch.arange(cols, device=dev, dtype=torch.float32) + 0.5) * pw
+        vv, uu = torch.meshgrid(v, u, indexing="ij")  # row-major: rows outer, cols inner
+        pix = torch.stack(
+            [uu.reshape(-1), vv.reshape(-1), torch.ones(rows * cols, device=dev)],
+            dim=-1,
+        )  # (N,3), N == rows*cols == target token count
+        p_cam = torch.einsum("bij,nj->bni", torch.inverse(tgt_K), pix)  # (B,N,3)
+        d_cam = p_cam / p_cam.norm(dim=-1, keepdim=True)
+        d = torch.einsum("bij,bnj->bni", tgt_T_cam[:, :3, :3], d_cam)
+        o = (tgt_T_cam[:, :3, 3] - window_origin_xyz)[:, None, :].expand(-1, rows * cols, -1)
+        return o, d
+
+    def _token_ray_pe(self, tgt_K, tgt_T_cam, window_origin_xyz, L: torch.Tensor):
+        """Ray PE aligned to input positions: position 0 is BOS (zero), position
+        i>=1 carries the ray of image token i-1."""
+        o, d = self._target_rays(tgt_K, tgt_T_cam, window_origin_xyz)
+        pe = self.ray_pe(o, d)  # (B,N,D)
+        zero = pe.new_zeros(pe.shape[0], 1, pe.shape[2])
+        return torch.cat([zero, pe[:, : L - 1]], dim=1)  # (B,L,D)
+
     def _sat_patch_world_xy(self, window_origin_xy: torch.Tensor) -> torch.Tensor:
         """World (x,y) of satellite patch centers. Sat crop is north-up and
         centered at the window-center vehicle position (512px @ mpp).
@@ -189,7 +261,7 @@ class ICASSP27Predictor(nn.Module):
         self,
         pose_vec: torch.Tensor,          # (B, 13)
         sat: Optional[torch.Tensor],     # (B,3,512,512) [0,1]
-        window_origin_xy: Optional[torch.Tensor],  # (B,2) world meters
+        window_origin_xyz: Optional[torch.Tensor],  # (B,3) world meters (window frame origin)
         src_rgbs: Optional[torch.Tensor],  # (B,K,3,H,W) [0,1]
         rel_poses: Optional[torch.Tensor],  # (B,K,9)
         src_mask: Optional[torch.Tensor] = None,  # (B,K) bool
@@ -197,10 +269,10 @@ class ICASSP27Predictor(nn.Module):
         parts = [self.pose_proj(pose_vec)]  # e_pose first token
         key_pad = [torch.zeros(pose_vec.shape[0], 1, dtype=torch.bool, device=pose_vec.device)]
         if self.use_sat:
-            assert sat is not None and window_origin_xy is not None
+            assert sat is not None and window_origin_xyz is not None
             B, K = src_rgbs.shape[:2] if src_rgbs is not None else (sat.shape[0], 0)
             f = self.dino(F.interpolate(sat, size=self.dino_sat_size, mode="bilinear", align_corners=False))
-            f = self.sat_proj(f) + self.metric_pe(self._sat_patch_world_xy(window_origin_xy))
+            f = self.sat_proj(f) + self.metric_pe(self._sat_patch_world_xy(window_origin_xyz[:, :2]))
             parts.append(f)
             key_pad.append(torch.zeros(B, f.shape[1], dtype=torch.bool, device=f.device))
         if self.use_src:
@@ -223,14 +295,19 @@ class ICASSP27Predictor(nn.Module):
         input_tokens: torch.Tensor,   # (B, L) teacher-forcing input (BOS-shifted)
         pose_vec: torch.Tensor,
         sat: Optional[torch.Tensor] = None,
-        window_origin_xy: Optional[torch.Tensor] = None,
+        window_origin_xyz: Optional[torch.Tensor] = None,   # (B,3) required when geo=raymap+use_sat
         src_rgbs: Optional[torch.Tensor] = None,
         rel_poses: Optional[torch.Tensor] = None,
         src_mask: Optional[torch.Tensor] = None,
+        tgt_K: Optional[torch.Tensor] = None,               # (B,3,3) required when geo=raymap
+        tgt_T_cam: Optional[torch.Tensor] = None,           # (B,4,4) required when geo=raymap
     ) -> torch.Tensor:
-        memory, key_padding = self.build_memory(pose_vec, sat, window_origin_xy, src_rgbs, rel_poses, src_mask)
+        memory, key_padding = self.build_memory(pose_vec, sat, window_origin_xyz, src_rgbs, rel_poses, src_mask)
         B, L = input_tokens.shape
         x = self.token_embed(input_tokens) + self.pos_embed[:, :L]
+        if self.geo == "raymap":
+            assert tgt_K is not None and tgt_T_cam is not None, "geo=raymap needs tgt_K and tgt_T_cam"
+            x = x + self._token_ray_pe(tgt_K, tgt_T_cam, window_origin_xyz if window_origin_xyz is not None else tgt_T_cam.new_zeros(B, 3), L)
         causal = torch.triu(torch.full((L, L), float("-inf"), device=x.device), diagonal=1)
         for blk in self.blocks:
             x = blk(x, memory, tgt_mask=causal, memory_key_padding_mask=key_padding)
@@ -238,14 +315,18 @@ class ICASSP27Predictor(nn.Module):
 
     @torch.no_grad()
     def generate(self, pose_vec, *, max_len: int, temperature: float = 1.0, top_p: float = 0.95,
-                 sat=None, window_origin_xy=None, src_rgbs=None, rel_poses=None, src_mask=None):
+                 sat=None, window_origin_xyz=None, src_rgbs=None, rel_poses=None, src_mask=None,
+                 tgt_K=None, tgt_T_cam=None):
         """AR sampling (temperature + top-p fixed policy, doc §3.5)."""
         B = pose_vec.shape[0]
         tokens = torch.full((B, 1), self.bos_idx, dtype=torch.long, device=pose_vec.device)
-        memory, key_padding = self.build_memory(pose_vec, sat, window_origin_xy, src_rgbs, rel_poses, src_mask)
+        memory, key_padding = self.build_memory(pose_vec, sat, window_origin_xyz, src_rgbs, rel_poses, src_mask)
         for _ in range(max_len):
             L = tokens.shape[1]
             x = self.token_embed(tokens) + self.pos_embed[:, :L]
+            if self.geo == "raymap":
+                assert tgt_K is not None and tgt_T_cam is not None, "geo=raymap needs tgt_K and tgt_T_cam"
+                x = x + self._token_ray_pe(tgt_K, tgt_T_cam, window_origin_xyz if window_origin_xyz is not None else tgt_T_cam.new_zeros(B, 3), L)
             causal = torch.triu(torch.full((L, L), float("-inf"), device=x.device), diagonal=1)
             for blk in self.blocks:
                 x = blk(x, memory, tgt_mask=causal, memory_key_padding_mask=key_padding)
