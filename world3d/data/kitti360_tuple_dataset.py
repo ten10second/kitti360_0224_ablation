@@ -8,7 +8,9 @@ One sample = one (window, sources, target) tuple:
   - target: a frame 2..20 m ahead of the last source (metric, not frame index),
     dyaw(source->target) <= dyaw_max_deg, extrapolation by construction.
   - eval mode is deterministic: fixed anchor stride, K from cfg, targets at
-    bin mid distances {[2,5):3.5, [5,10):7.5, [10,20]:15} m.
+    bin mid distances {[2,5):3.5, [5,10):7.5, [10,20]:15} m by default.
+    An explicit ``eval_distances`` sequence can replace those midpoints for
+    inference-only dense-distance diagnostics; it never affects training.
 
 Poses: prefer per-frame cam0_to_world.txt (cam0 = image_00 rectified);
 fallback imu pose @ calib_cam_to_pose['image_00']. World frame is the shared
@@ -66,6 +68,7 @@ class Kitti360TupleDataset(Dataset):
         k_min: int = 1,
         k_max: int = 3,
         eval_k: Tuple[int, ...] = (1, 3),
+        eval_distances: Optional[Tuple[float, ...]] = None,
         dist_min_m: float = 2.0,
         dist_max_m: float = 20.0,
         dyaw_max_deg: float = 20.0,
@@ -82,6 +85,18 @@ class Kitti360TupleDataset(Dataset):
         self.k_min, self.k_max = int(k_min), int(k_max)
         self.eval_k = tuple(eval_k)
         self.dist_min_m, self.dist_max_m = float(dist_min_m), float(dist_max_m)
+        self.eval_distances = None if eval_distances is None else tuple(
+            float(distance) for distance in eval_distances
+        )
+        if self.eval_distances is not None:
+            if not self.eval_distances:
+                raise ValueError("eval_distances must be non-empty when provided")
+            if len(set(self.eval_distances)) != len(self.eval_distances):
+                raise ValueError("eval_distances must not contain duplicates")
+            if any(not self.dist_min_m <= distance <= self.dist_max_m for distance in self.eval_distances):
+                raise ValueError(
+                    f"eval_distances must lie in [{self.dist_min_m}, {self.dist_max_m}] m"
+                )
         self.dyaw_max_deg = float(dyaw_max_deg)
         self.seed = int(seed)
         self.epoch = 0
@@ -188,8 +203,11 @@ class Kitti360TupleDataset(Dataset):
                     if yaw_a is None:
                         a += self.anchor_stride_m
                         continue
-                    for lo, hi in self.bins:
-                        dist = (lo + hi) / 2.0
+                    if self.mode == "eval" and self.eval_distances is not None:
+                        distances = self.eval_distances
+                    else:
+                        distances = tuple((lo + hi) / 2.0 for lo, hi in self.bins)
+                    for dist in distances:
                         target_fid = frame_at_arc(a + (self.k_min - 1) * self.anchor_spacing_m + dist)
                         if target_fid < 0:
                             continue
@@ -293,10 +311,17 @@ class Kitti360TupleDataset(Dataset):
             src_rgbs.append(torch.from_numpy(rgb))
             src_Ks.append(torch.from_numpy(Ks.astype(np.float32)))
             src_Ts.append(torch.from_numpy(Ts.astype(np.float32)))
-            # rel pose target->source in window frame (translation-only origin shift)
-            dt = (Ts[:3, 3] - T_tgt[:3, 3]).astype(np.float32)
+            # Target -> source pose in the target-camera frame.  Translation,
+            # rotation, target rays, and satellite patch coordinates now share
+            # this reference; do not express dt in global/world axes.
+            dt_world = Ts[:3, 3] - T_tgt[:3, 3]
+            dt = (T_tgt[:3, :3].T @ dt_world).astype(np.float32)
             R_rel = (T_tgt[:3, :3].T @ Ts[:3, :3]).astype(np.float32)
             rel_poses.append(torch.from_numpy(np.concatenate([dt, rotmat_to_6d(torch.from_numpy(R_rel)).numpy()])))
+
+        # Requested distance is sampled along the route; use this actual
+        # camera-center ground-plane distance for reporting/evaluation bins.
+        actual_source_target_dist_m = float(np.linalg.norm(src_Ts[-1][:2, 3] - T_tgt[:2, 3]))
 
         # window-shared satellite crop (from window center frame)
         sat_rec = fr[spec.window_center_fid]
@@ -316,6 +341,12 @@ class Kitti360TupleDataset(Dataset):
         )
 
         bin_id = next((i for i, (lo, hi) in enumerate(self.bins) if lo <= dist < hi or (i == len(self.bins) - 1 and dist == hi)), -1)
+        actual_bin_id = next(
+            (i for i, (lo, hi) in enumerate(self.bins)
+             if lo <= actual_source_target_dist_m < hi
+             or (i == len(self.bins) - 1 and actual_source_target_dist_m == hi)),
+            -1,
+        )
 
         return {
             "tgt_rgb": torch.from_numpy(tgt_rgb),
@@ -331,13 +362,16 @@ class Kitti360TupleDataset(Dataset):
             "sat": sat_t,
             "window_origin_xyz": origin_xyz,
             "sat_m_per_px": self.sat_m_per_px,
+            "actual_source_target_dist_m": actual_source_target_dist_m,
             "meta": {
                 "drive": spec.drive,
                 "window_id": spec.window_id,
                 "source_fids": source_fids,
                 "target_fid": target_fid,
                 "dist_m": float(dist),
+                "actual_source_target_dist_m": actual_source_target_dist_m,
                 "bin": bin_id,
+                "actual_bin": actual_bin_id,
                 "dyaw_deg": float(spec.dyaw_deg),
                 "split_mode": self.mode,
             },
@@ -374,5 +408,8 @@ def collate_tuples(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
         "n_src": torch.tensor([b["n_src"] for b in batch], dtype=torch.long),
         "sat": torch.stack([b["sat"] for b in batch]),
         "window_origin_xyz": torch.stack([b["window_origin_xyz"] for b in batch]),
+        "actual_source_target_dist_m": torch.tensor(
+            [b["actual_source_target_dist_m"] for b in batch], dtype=torch.float32
+        ),
         "meta": [b["meta"] for b in batch],
     }

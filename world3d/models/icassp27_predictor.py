@@ -2,8 +2,9 @@
 
 Doc mapping (ICASSP27_method_framework.md):
 - §3.1 tokenizer stays external (models/stage1/maskgit/tokenizer.py), frozen.
-- §3.2 satellite branch: DINOv2(sat) patch tokens + metric PE (Fourier on
-  per-patch world (x,y) meters, added per token). No BEV sampling.
+- §3.2 satellite branch: DINOv2(sat) patch tokens + target-relative planar
+  PE.  Each patch is represented in the target camera's (right, forward)
+  ground-plane frame; no BEV sampling or target recropping is used.
 - §3.3 street branch: shared DINOv2 backbone; per-source rel-pose
   (dt(3)+rot6d(6) -> MLP) added to ALL tokens of that source; variable K
   concatenated in order.
@@ -24,6 +25,7 @@ are resized to multiples of 14 (518 for sat 512px, 518x252 for 640x256 street).
 """
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -96,7 +98,12 @@ class MetricPE(nn.Module):
 
 
 class RelPoseProjector(nn.Module):
-    """Per-source relative pose (dt 3 + rot6d 6) -> D, broadcast over tokens."""
+    """Target-camera-frame source pose (dt 3 + rot6d 6) -> D per source.
+
+    ``dt`` is target -> source expressed in target camera axes, and the
+    relative rotation maps source camera coordinates into target camera axes.
+    The embedding is broadcast across every token of that source view.
+    """
 
     def __init__(self, d_model: int, hidden: int = 256):
         super().__init__()
@@ -110,14 +117,37 @@ class RelPoseProjector(nn.Module):
         return self.mlp(dp)  # (B,K,D)
 
 
-class TargetRayPE(nn.Module):
-    """Per-token target-view ray embedding (geo=raymap, mainstream conditioning).
+class TargetRelativeSatPE(nn.Module):
+    """MLP PE for a satellite patch in target-camera planar coordinates.
 
-    Each target token (40x16 grid) gets the 6-dim (o, d) of its pixel's camera
-    ray: origin o = camera center in the WINDOW-LOCAL frame (this is what makes
-    the absolute position within the shared satellite window observable), and
-    unit direction d = R @ K^-1 (u,v,1) / |.|. Encoded by a small MLP and added
-    to the token embedding — same injection pattern as MetricPE / RelPose.
+    The input is normalized (right / R, forward / R), where R is the satellite
+    crop half-width in meters.  This intentionally avoids the high-frequency
+    absolute-world Fourier features used by the legacy pilot.
+    """
+
+    def __init__(self, d_model: int, hidden: int = 256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(5, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, d_model),
+        )
+
+    def forward(self, xz: torch.Tensor) -> torch.Tensor:
+        """xz: (B,N,2), normalized (right, forward) -> (B,N,d_model)."""
+        x, z = xz.unbind(dim=-1)
+        rho = torch.sqrt(x.square() + z.square())
+        theta = torch.atan2(x, z)
+        feat = torch.stack([x, z, rho, torch.sin(theta), torch.cos(theta)], dim=-1)
+        return self.mlp(feat)
+
+
+class TargetRayPE(nn.Module):
+    """Per-token target-view ray embedding (geo=raymap).
+
+    Each target token gets its 6-dim camera-local ray (o, d).  The target camera
+    is the common reference frame for rays, source poses, and satellite patch
+    coordinates, so o is identically zero and d is not rotated to world axes.
     """
 
     def __init__(self, d_model: int, hidden: int = 256):
@@ -151,6 +181,8 @@ class ICASSP27Predictor(nn.Module):
         use_sat: bool = True,
         use_src: bool = True,
         fourier_freqs: int = 10,
+        sat_pe_mode: str = "target_relative",  # target_relative | legacy_fourier
+        sat_coord_scale_m: Optional[float] = None,
         sat_px: int = 512,               # on-disk satellite size
         sat_m_per_px: float = 0.196,
         src_size: tuple = (640, 256),    # (W,H) of street images
@@ -160,6 +192,7 @@ class ICASSP27Predictor(nn.Module):
         super().__init__()
         assert sat_encoder in ("dino", "satmae")
         assert geo in ("raymap", "pose_add", "proj")
+        assert sat_pe_mode in ("target_relative", "legacy_fourier")
         if sat_encoder == "satmae":
             raise NotImplementedError("SatMAE ablation branch: wire models/multiscale_vit_encoder.py here")
         if geo == "proj":
@@ -172,6 +205,12 @@ class ICASSP27Predictor(nn.Module):
         self.use_src = use_src
         self.sat_px = sat_px
         self.sat_m_per_px = sat_m_per_px
+        self.sat_pe_mode = sat_pe_mode
+        self.sat_coord_scale_m = float(
+            sat_coord_scale_m if sat_coord_scale_m is not None else sat_px * sat_m_per_px / 2.0
+        )
+        if self.sat_coord_scale_m <= 0:
+            raise ValueError("sat_coord_scale_m must be positive")
 
         # encoders (shared DINOv2 for sat & street, doc §3.3).
         # Branch-specific heads are built ONLY when their branch is enabled,
@@ -179,7 +218,8 @@ class ICASSP27Predictor(nn.Module):
         self.dino = DinoV2Encoder(dino_arch)
         self.sat_proj = nn.Linear(self.dino.dim, d_model) if use_sat else None
         self.src_proj = nn.Linear(self.dino.dim, d_model) if use_src else None
-        self.metric_pe = MetricPE(d_model, fourier_freqs) if use_sat else None
+        self.metric_pe = MetricPE(d_model, fourier_freqs) if use_sat and sat_pe_mode == "legacy_fourier" else None
+        self.sat_pe = TargetRelativeSatPE(d_model) if use_sat and sat_pe_mode == "target_relative" else None
         self.rel_pose = RelPoseProjector(d_model) if use_src else None
         self.ray_pe = TargetRayPE(d_model) if geo == "raymap" else None
         self.pose_proj = VanillaPoseProjector(pose_dim, d_model)  # e_pose reuse
@@ -211,40 +251,45 @@ class ICASSP27Predictor(nn.Module):
 
     # ------------------------------------------------------------- memory
     # ------------------------------------------------------------ target rays
-    def _target_rays(self, tgt_K: torch.Tensor, tgt_T_cam: torch.Tensor, window_origin_xyz: torch.Tensor):
-        """(o, d) per target token. o = camera center in the window frame;
-        d = unit ray direction from intrinsics + camera rotation.
-        Returns two (B, rows*cols, 3) tensors in token raster order."""
+    def _target_rays(self, tgt_K: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return camera-local (origin, direction) for every target token.
+
+        The target camera is the geometric reference: all origins are zero and
+        directions are normalized K^-1[u,v,1] rays in KITTI camera axes.
+        """
         B = tgt_K.shape[0]
         dev = tgt_K.device
         rows, cols = self.target_rows, self.target_cols
         ph = self.img_h / rows
         pw = self.img_w / cols
-        v = (torch.arange(rows, device=dev, dtype=torch.float32) + 0.5) * ph
-        u = (torch.arange(cols, device=dev, dtype=torch.float32) + 0.5) * pw
+        v = (torch.arange(rows, device=dev, dtype=tgt_K.dtype) + 0.5) * ph
+        u = (torch.arange(cols, device=dev, dtype=tgt_K.dtype) + 0.5) * pw
         vv, uu = torch.meshgrid(v, u, indexing="ij")  # row-major: rows outer, cols inner
         pix = torch.stack(
-            [uu.reshape(-1), vv.reshape(-1), torch.ones(rows * cols, device=dev)],
+            [uu.reshape(-1), vv.reshape(-1), torch.ones(rows * cols, device=dev, dtype=tgt_K.dtype)],
             dim=-1,
         )  # (N,3), N == rows*cols == target token count
         p_cam = torch.einsum("bij,nj->bni", torch.inverse(tgt_K), pix)  # (B,N,3)
         d_cam = p_cam / p_cam.norm(dim=-1, keepdim=True)
-        d = torch.einsum("bij,bnj->bni", tgt_T_cam[:, :3, :3], d_cam)
-        o = (tgt_T_cam[:, :3, 3] - window_origin_xyz)[:, None, :].expand(-1, rows * cols, -1)
-        return o, d
+        o = torch.zeros_like(d_cam)
+        return o, d_cam
 
-    def _token_ray_pe(self, tgt_K, tgt_T_cam, window_origin_xyz, L: torch.Tensor):
+    def _token_ray_pe(self, tgt_K: torch.Tensor, L: int):
         """Ray PE aligned to input positions: position 0 is BOS (zero), position
         i>=1 carries the ray of image token i-1."""
-        o, d = self._target_rays(tgt_K, tgt_T_cam, window_origin_xyz)
+        o, d = self._target_rays(tgt_K)
         pe = self.ray_pe(o, d)  # (B,N,D)
         zero = pe.new_zeros(pe.shape[0], 1, pe.shape[2])
         return torch.cat([zero, pe[:, : L - 1]], dim=1)  # (B,L,D)
 
     def _sat_patch_world_xy(self, window_origin_xy: torch.Tensor) -> torch.Tensor:
-        """World (x,y) of satellite patch centers. Sat crop is north-up and
-        centered at the window-center vehicle position (512px @ mpp).
-        Returns (B, Ns, 2) meters."""
+        """Intermediate world (east, north) satellite patch centers.
+
+        The crop is north-up and centered at the window-center vehicle
+        position.  Target-relative PE immediately converts these points to
+        target-camera (right, forward) coordinates; it never encodes this
+        absolute world representation in the target-centric pilot.
+        """
         B = window_origin_xy.shape[0]
         gh, gw = self.sat_grid  # rows (v, south+), cols (u, east+)
         dev = window_origin_xy.device
@@ -259,6 +304,24 @@ class ICASSP27Predictor(nn.Module):
         y = window_origin_xy[:, 1:2] - (vv.reshape(1, -1) - self.sat_px / 2.0) * self.sat_m_per_px
         return torch.stack([x, y], dim=-1)  # (B, Ns, 2)
 
+    @staticmethod
+    def _world_xy_to_target_xz(world_xy: torch.Tensor, tgt_T_cam: torch.Tensor) -> torch.Tensor:
+        """Express world XY points as (right, forward) in each target's frame."""
+        target_xy = tgt_T_cam[:, None, :2, 3]
+        delta = world_xy - target_xy
+        right_xy = tgt_T_cam[:, :2, 0]
+        forward_xy = tgt_T_cam[:, :2, 2]
+        right_xy = right_xy / right_xy.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        forward_xy = forward_xy / forward_xy.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        right = torch.einsum("bni,bi->bn", delta, right_xy)
+        forward = torch.einsum("bni,bi->bn", delta, forward_xy)
+        return torch.stack([right, forward], dim=-1)
+
+    def _sat_patch_target_xy(self, window_origin_xyz: torch.Tensor, tgt_T_cam: torch.Tensor) -> torch.Tensor:
+        """Satellite patch centers as target-relative (right_m, forward_m)."""
+        world_xy = self._sat_patch_world_xy(window_origin_xyz[:, :2])
+        return self._world_xy_to_target_xz(world_xy, tgt_T_cam)
+
     def build_memory(
         self,
         pose_vec: torch.Tensor,          # (B, 13)
@@ -267,14 +330,71 @@ class ICASSP27Predictor(nn.Module):
         src_rgbs: Optional[torch.Tensor],  # (B,K,3,H,W) [0,1]
         rel_poses: Optional[torch.Tensor],  # (B,K,9)
         src_mask: Optional[torch.Tensor] = None,  # (B,K) bool
+        tgt_T_cam: Optional[torch.Tensor] = None,  # (B,4,4), required by target_relative sat PE
+        sat_memory_mode: str = "real",
+        sat_memory_perm: Optional[torch.Tensor] = None,
+        sat_token_perm: Optional[torch.Tensor] = None,
+        sat_memory_scale: float = 1.0,
     ):
+        if sat_memory_mode not in ("real", "zero", "shuffle", "pe_permute", "rot90"):
+            raise ValueError(
+                "sat_memory_mode must be one of real/zero/shuffle/pe_permute/rot90, "
+                f"got {sat_memory_mode!r}"
+            )
         parts = [self.pose_proj(pose_vec)]  # e_pose first token
         key_pad = [torch.zeros(pose_vec.shape[0], 1, dtype=torch.bool, device=pose_vec.device)]
         if self.use_sat:
             assert sat is not None and window_origin_xyz is not None
             B, K = src_rgbs.shape[:2] if src_rgbs is not None else (sat.shape[0], 0)
-            f = self.dino(F.interpolate(sat, size=self.dino_sat_size, mode="bilinear", align_corners=False))
-            f = self.sat_proj(f) + self.metric_pe(self._sat_patch_world_xy(window_origin_xyz[:, :2]))
+            sat_input = torch.rot90(sat, k=1, dims=(-2, -1)) if sat_memory_mode == "rot90" else sat
+            visual = self.sat_proj(
+                self.dino(F.interpolate(sat_input, size=self.dino_sat_size, mode="bilinear", align_corners=False))
+            )
+            if sat_memory_mode == "zero":
+                f = torch.zeros_like(visual)
+            else:
+                if self.sat_pe_mode == "target_relative":
+                    assert tgt_T_cam is not None, "target_relative satellite PE needs tgt_T_cam"
+                    pe = self.sat_pe(
+                        self._sat_patch_target_xy(window_origin_xyz, tgt_T_cam) / self.sat_coord_scale_m
+                    )
+                else:
+                    pe = self.metric_pe(self._sat_patch_world_xy(window_origin_xyz[:, :2]))
+                if sat_memory_mode == "shuffle":
+                    if sat_memory_perm is None:
+                        perm = torch.roll(torch.arange(B, device=visual.device), shifts=1)
+                    else:
+                        perm = torch.as_tensor(sat_memory_perm, device=visual.device, dtype=torch.long)
+                        if perm.ndim != 1 or perm.numel() != B:
+                            raise ValueError(f"sat_memory_perm must have shape ({B},), got {tuple(perm.shape)}")
+                        expected = torch.arange(B, device=visual.device)
+                        if not torch.equal(torch.sort(perm).values, expected):
+                            raise ValueError("sat_memory_perm must be a permutation of the batch indices")
+                    visual = visual.index_select(0, perm)
+                elif sat_memory_mode == "pe_permute":
+                    n_tokens = visual.shape[1]
+                    if sat_token_perm is None:
+                        token_perm = torch.roll(torch.arange(n_tokens, device=visual.device), shifts=1)
+                    else:
+                        token_perm = torch.as_tensor(sat_token_perm, device=visual.device, dtype=torch.long)
+                        if token_perm.ndim != 1 or token_perm.numel() != n_tokens:
+                            raise ValueError(
+                                f"sat_token_perm must have shape ({n_tokens},), got {tuple(token_perm.shape)}"
+                            )
+                        expected = torch.arange(n_tokens, device=visual.device)
+                        if not torch.equal(torch.sort(token_perm).values, expected):
+                            raise ValueError("sat_token_perm must be a permutation of satellite token indices")
+                    pe = pe.index_select(1, token_perm)
+                f = visual + pe
+            # Inference-only strength diagnostic: scale the COMPLETE satellite
+            # memory (DINO visual content + its target-relative PE) while
+            # retaining the original memory slots, source evidence, pose token,
+            # and target-ray PE.  Values other than 1.0 create distribution
+            # shift and are not a training or primary-paper intervention.
+            sat_memory_scale = float(sat_memory_scale)
+            if not math.isfinite(sat_memory_scale) or sat_memory_scale < 0:
+                raise ValueError("sat_memory_scale must be a finite non-negative scalar")
+            f = f * sat_memory_scale
             parts.append(f)
             key_pad.append(torch.zeros(B, f.shape[1], dtype=torch.bool, device=f.device))
         if self.use_src:
@@ -303,13 +423,21 @@ class ICASSP27Predictor(nn.Module):
         src_mask: Optional[torch.Tensor] = None,
         tgt_K: Optional[torch.Tensor] = None,               # (B,3,3) required when geo=raymap
         tgt_T_cam: Optional[torch.Tensor] = None,           # (B,4,4) required when geo=raymap
+        sat_memory_mode: str = "real",
+        sat_memory_perm: Optional[torch.Tensor] = None,
+        sat_token_perm: Optional[torch.Tensor] = None,
+        sat_memory_scale: float = 1.0,
     ) -> torch.Tensor:
-        memory, key_padding = self.build_memory(pose_vec, sat, window_origin_xyz, src_rgbs, rel_poses, src_mask)
+        memory, key_padding = self.build_memory(
+            pose_vec, sat, window_origin_xyz, src_rgbs, rel_poses, src_mask, tgt_T_cam,
+            sat_memory_mode=sat_memory_mode, sat_memory_perm=sat_memory_perm,
+            sat_token_perm=sat_token_perm, sat_memory_scale=sat_memory_scale,
+        )
         B, L = input_tokens.shape
         x = self.token_embed(input_tokens) + self.pos_embed[:, :L]
         if self.geo == "raymap":
             assert tgt_K is not None and tgt_T_cam is not None, "geo=raymap needs tgt_K and tgt_T_cam"
-            x = x + self._token_ray_pe(tgt_K, tgt_T_cam, window_origin_xyz if window_origin_xyz is not None else tgt_T_cam.new_zeros(B, 3), L)
+            x = x + self._token_ray_pe(tgt_K, L)
         causal = torch.triu(torch.full((L, L), float("-inf"), device=x.device), diagonal=1)
         for blk in self.blocks:
             x = blk(x, memory, tgt_mask=causal, memory_key_padding_mask=key_padding)
@@ -318,17 +446,24 @@ class ICASSP27Predictor(nn.Module):
     @torch.no_grad()
     def generate(self, pose_vec, *, max_len: int, temperature: float = 1.0, top_p: float = 0.95,
                  sat=None, window_origin_xyz=None, src_rgbs=None, rel_poses=None, src_mask=None,
-                 tgt_K=None, tgt_T_cam=None):
+                 tgt_K=None, tgt_T_cam=None, sat_memory_mode: str = "real",
+                 sat_memory_perm: Optional[torch.Tensor] = None,
+                 sat_token_perm: Optional[torch.Tensor] = None,
+                 sat_memory_scale: float = 1.0):
         """AR sampling (temperature + top-p fixed policy, doc §3.5)."""
         B = pose_vec.shape[0]
         tokens = torch.full((B, 1), self.bos_idx, dtype=torch.long, device=pose_vec.device)
-        memory, key_padding = self.build_memory(pose_vec, sat, window_origin_xyz, src_rgbs, rel_poses, src_mask)
+        memory, key_padding = self.build_memory(
+            pose_vec, sat, window_origin_xyz, src_rgbs, rel_poses, src_mask, tgt_T_cam,
+            sat_memory_mode=sat_memory_mode, sat_memory_perm=sat_memory_perm,
+            sat_token_perm=sat_token_perm, sat_memory_scale=sat_memory_scale,
+        )
         for _ in range(max_len):
             L = tokens.shape[1]
             x = self.token_embed(tokens) + self.pos_embed[:, :L]
             if self.geo == "raymap":
                 assert tgt_K is not None and tgt_T_cam is not None, "geo=raymap needs tgt_K and tgt_T_cam"
-                x = x + self._token_ray_pe(tgt_K, tgt_T_cam, window_origin_xyz if window_origin_xyz is not None else tgt_T_cam.new_zeros(B, 3), L)
+                x = x + self._token_ray_pe(tgt_K, L)
             causal = torch.triu(torch.full((L, L), float("-inf"), device=x.device), diagonal=1)
             for blk in self.blocks:
                 x = blk(x, memory, tgt_mask=causal, memory_key_padding_mask=key_padding)

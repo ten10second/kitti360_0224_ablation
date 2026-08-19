@@ -70,21 +70,14 @@ def main():
     gnorm = sum(p.grad.abs().sum().item() for p in model.parameters() if p.grad is not None)
     print(f"loss {loss.item():.4f}  grad-mass {gnorm:.3f}  (grads flowing)")
 
-    # --- raymap semantics: translating the tuple within the window MUST change conditioning ---
-    tT2 = tT.clone(); tT2[:, 0, 3] += 30.0  # same window, target 30 m further east
-    o1, d1 = model._target_rays(tK, tT, origin)
-    o2, _ = model._target_rays(tK, tT2, origin)
-    ray_shift = (o2 - o1).norm(dim=-1).mean().item()
-    print(f"ray origin shift when target moves +30m in-window: {ray_shift:.1f} m (expect ~30)")
-    assert abs(ray_shift - 30.0) < 0.5
-    pe1 = model._token_ray_pe(tK, tT, origin, L)
-    pe2 = model._token_ray_pe(tK, tT2, origin, L)
-    pe_diff = (pe1 - pe2).abs().sum(-1)[:, 1:].mean().item()  # skip BOS position
-    print(f"ray PE per-token |diff| after +30m shift: {pe_diff:.3f} (expect >> 0; B0 no longer translation-invariant)")
-    assert pe_diff > 0.1
+    # --- raymap semantics: target rays are camera-local and have zero origin ---
+    ray_o, ray_d = model._target_rays(tK)
+    print(f"ray origin max |.| {ray_o.abs().max().item():.2e}; center direction {ray_d[0, 8 * 40 + 20].tolist()}")
+    assert torch.allclose(ray_o, torch.zeros_like(ray_o))
+    assert ray_d[0, 8 * 40 + 20, 2] > 0
 
     # memory token accounting
-    mem, pad = model.build_memory(pose, sat, origin, src, rel, mask)
+    mem, pad = model.build_memory(pose, sat, origin, src, rel, mask, tT)
     n_sat = model.sat_grid[0] * model.sat_grid[1]
     exp = 1 + n_sat + int(mask.shape[1]) * model.src_tokens_per_view
     print(f"memory: {tuple(mem.shape)} (expected {exp})  pad tokens {int(pad.sum())}")
@@ -98,7 +91,8 @@ def main():
 
     # geo=pose_add ablation row (no ray inputs needed)
     mp = ICASSP27Predictor(d_model=128, num_layers=1, geo="pose_add").to(dev)
-    lp = mp(inp, pose, sat=sat, window_origin_xyz=origin, src_rgbs=src, rel_poses=rel, src_mask=mask)
+    lp = mp(inp, pose, sat=sat, window_origin_xyz=origin, src_rgbs=src, rel_poses=rel, src_mask=mask,
+            tgt_T_cam=tT)
     print(f"geo=pose_add logits {tuple(lp.shape)}")
 
     # generate smoke (few tokens)

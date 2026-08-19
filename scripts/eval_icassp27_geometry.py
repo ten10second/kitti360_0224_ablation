@@ -160,8 +160,9 @@ def main():
             if valid.sum() < 500:
                 continue
             rec = {
-                "ckpt_step": step, "bin": m["bin"], "K": int(batch["n_src"][b]),
-                "dist_m": round(m["dist_m"], 2), "drive": m["drive"], "target_fid": fid,
+                "ckpt_step": step, "bin": m["actual_bin"], "K": int(batch["n_src"][b]),
+                "dist_m": round(m["actual_source_target_dist_m"], 2),
+                "requested_dist_m": round(m["dist_m"], 2), "drive": m["drive"], "target_fid": fid,
                 "absrel_gen": absrel_scale_aligned(d_gen[b], gt_depth, valid),
                 "absrel_real": absrel_scale_aligned(d_real[b], gt_depth, valid),
                 "absrel_vq": absrel_scale_aligned(d_vq[b], gt_depth, valid),

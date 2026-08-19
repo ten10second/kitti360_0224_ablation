@@ -32,11 +32,11 @@ from scripts.eval_icassp27_binned import build_model_from_ckpt
 def forward_with_attn(model, inp, pose, sat, origin, src, rel, mask, tK, tT):
     """Manual layer loop mirroring ICASSP27Predictor.forward, returning
     per-layer cross-attention weights (B, L, S), head-averaged."""
-    memory, key_padding = model.build_memory(pose, sat, origin, src, rel, mask)
+    memory, key_padding = model.build_memory(pose, sat, origin, src, rel, mask, tT)
     B, L = inp.shape
     x = model.token_embed(inp) + model.pos_embed[:, :L]
     if model.geo == "raymap":
-        x = x + model._token_ray_pe(tK, tT, origin, L)
+        x = x + model._token_ray_pe(tK, L)
     causal = torch.triu(torch.full((L, L), float("-inf"), device=x.device), diagonal=1)
     weights = []
     for blk in model.blocks:

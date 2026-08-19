@@ -36,6 +36,8 @@ def build_model_from_ckpt(ckpt_path: str, device):
         dino_arch=cfg["dino_arch"], sat_encoder=cfg["sat_encoder"], geo=cfg.get("geo", "raymap"),
         use_sat=cfg.get("use_sat", True), use_src=cfg.get("use_src", True),
         fourier_freqs=cfg.get("fourier_freqs", 10), sat_px=cfg.get("sat_px", 512),
+        sat_pe_mode=cfg.get("sat_pe_mode", "legacy_fourier"),
+        sat_coord_scale_m=cfg.get("sat_coord_scale_m", None),
         sat_m_per_px=cfg.get("sat_m_per_px", 0.196),
     ).to(device).eval()
     model.load_state_dict(ckpt["model"], strict=True)
@@ -111,8 +113,9 @@ def main():
         for b in range(B):
             m = batch["meta"][b]
             records.append({
-                "ckpt_step": step, "bin": m["bin"], "K": int(batch["n_src"][b]),
-                "dist_m": round(m["dist_m"], 2), "dyaw_deg": round(m["dyaw_deg"], 2),
+                "ckpt_step": step, "bin": m["actual_bin"], "K": int(batch["n_src"][b]),
+                "dist_m": round(m["actual_source_target_dist_m"], 2),
+                "requested_dist_m": round(m["dist_m"], 2), "dyaw_deg": round(m["dyaw_deg"], 2),
                 "drive": m["drive"], "target_fid": m["target_fid"],
                 "psnr": float(p[b]), "lpips": float(l[b]),
             })

@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import subprocess
 import time
 from pathlib import Path
 
@@ -26,6 +27,16 @@ from torch.utils.data import DataLoader
 from models.stage1.maskgit.tokenizer import PretrainedTokenizer
 from world3d.data.kitti360_tuple_dataset import Kitti360TupleDataset, collate_tuples
 from world3d.models.icassp27_predictor import ICASSP27Predictor
+
+
+def git_commit_sha() -> str:
+    """Record the source revision in every checkpoint without making git required."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
 
 
 def decode_and_save(vq, model, batch, device, path: Path, max_show: int = 3):
@@ -129,14 +140,17 @@ def main():
         geo=cfg.model.get("geo", "raymap"),
         use_sat=cfg.model.use_sat,
         use_src=cfg.model.use_src,
-        fourier_freqs=cfg.model.fourier_freqs,
+        fourier_freqs=cfg.model.get("fourier_freqs", 10),
+        sat_pe_mode=cfg.model.get("sat_pe_mode", "legacy_fourier"),
+        sat_coord_scale_m=cfg.model.get("sat_coord_scale_m", None),
         sat_px=cfg.model.sat_px,
         sat_m_per_px=cfg.model.sat_m_per_px,
     ).to(device)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_total = sum(p.numel() for p in model.parameters())
     print(f"[model] trainable {n_train/1e6:.1f}M / total {n_total/1e6:.1f}M  "
-          f"sat={cfg.model.use_sat} src={cfg.model.use_src}")
+          f"sat={cfg.model.use_sat} src={cfg.model.use_src} "
+          f"sat_pe={cfg.model.get('sat_pe_mode', 'legacy_fourier')} geo={cfg.model.get('geo', 'raymap')}")
 
     opt = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
@@ -204,6 +218,7 @@ def main():
                     "model": model.state_dict(),
                     "config": OmegaConf.to_container(cfg),
                     "step": step,
+                    "git_commit": git_commit_sha(),
                 }, out_dir / "ckpt.pt")
         # loader exhausted -> new epoch, fresh stochastic sampling
         train_ds.epoch += 1
