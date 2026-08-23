@@ -17,7 +17,7 @@ import yaml
 
 # Configuration
 SAT_IMG_PATH = "squence_03_frame0.png"
-METERS_PER_PIXEL = 0.2   # 0.2 m / pixel
+METERS_PER_PIXEL = 0.196   # measured KITTI-360 resolution
 
 # Camera mounting angle (relative to vehicle front)
 # This needs to be adjusted based on which camera is being used.
@@ -205,4 +205,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

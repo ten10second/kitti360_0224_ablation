@@ -132,7 +132,7 @@ def render_sat_with_frustum(
     K: np.ndarray,
     T_cam_to_world: np.ndarray,
     T_imu_to_world: np.ndarray,
-    sat_resolution: float = 0.2,
+    sat_resolution: float = 0.196,
     cam_h: int = 256,
     cam_w: int = 640,
     fill_alpha: float = 0.35,

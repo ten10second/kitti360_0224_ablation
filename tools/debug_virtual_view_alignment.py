@@ -52,7 +52,7 @@ def compute_inverse_projection_view(
     target_w: int,
     device: torch.device,
     bev_size: int = 512,
-    resolution: float = 0.2,
+    resolution: float = 0.196,
 ):
     """Same BEV->camera backward warping wrapper as train_ar_1215_rot.py."""
     if sat_img is None or K is None or T_cam_to_world is None or T_imu_to_world is None:
@@ -193,4 +193,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

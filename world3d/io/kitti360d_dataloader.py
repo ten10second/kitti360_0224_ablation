@@ -404,7 +404,7 @@ class Kitti360dDataset(Dataset):
         self.front_center_crop = front_center_crop  # (W,H) if not None
 
         # Satellite image properties
-        self.sat_m_per_px: float = 0.2  # meters per pixel in satellite image
+        self.sat_m_per_px: float = 0.196  # measured KITTI-360 isotropic resolution
         self.sat_size: Tuple[int, int] = (512, 512)  # (W,H), as stored on disk
         self.require_exact_pose = bool(require_exact_pose)
 
@@ -862,4 +862,3 @@ class Kitti360dDataset(Dataset):
                 "aug": aug_meta,
             },
         }
-

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Utilities to align the 3D BEV grid (vehicle-centric) with the satellite image
-(1024x1024, 0.2 m/pixel, centered at vehicle GPS).
+Utilities to align the 3D BEV grid (vehicle-centric) with the KITTI-360
+satellite image (512x512, 0.196 m/pixel, centered at vehicle GPS).
 
 Assumptions:
 - Satellite is north-up (y_north increases toward image top), pixel (cx,cy) at image center.
@@ -15,11 +15,11 @@ from typing import Tuple
 
 @dataclass
 class SatSpec:
-    width: int = 1024
-    height: int = 1024
-    meters_per_pixel: float = 0.2
-    cx: float = 512.0
-    cy: float = 512.0
+    width: int = 512
+    height: int = 512
+    meters_per_pixel: float = 0.196
+    cx: float = 256.0
+    cy: float = 256.0
 
 
 def veh_to_enu(x_fwd: float, y_left: float, yaw_rad: float) -> Tuple[float, float]:
@@ -61,4 +61,3 @@ def bev_grid_to_sat_indices(nx: int, ny: int, x_min: float, x_max: float, y_min:
             out[iy, ix, 0] = u
             out[iy, ix, 1] = v
     return out
-

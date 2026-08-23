@@ -20,7 +20,7 @@ def compute_bev_visibility_mask(
     T_imu_to_world: torch.Tensor,
     bev_size: int = 64,
     sat_pixels: int = 512,
-    sat_resolution: float = 0.2,
+    sat_resolution: float = 0.196,
     cam_h: int = 256,
     cam_w: int = 640,
 ) -> torch.Tensor:

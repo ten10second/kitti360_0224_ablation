@@ -312,7 +312,7 @@ def load_oxts_pose(oxts_file: str, origin: Optional[Tuple[float, float, float]] 
 
 def get_world_to_satellite_transform(
     sat_size: int = 512,
-    resolution_m_per_px: float = 0.2,
+    resolution_m_per_px: float = 0.196,
     device: Optional[torch.device] = None
 ) -> torch.Tensor:
     """
@@ -335,7 +335,7 @@ def get_world_to_satellite_transform(
 
     Args:
         sat_size: Satellite image size in pixels (default: 512)
-        resolution_m_per_px: Satellite resolution in meters per pixel (default: 0.2)
+        resolution_m_per_px: Satellite resolution in meters per pixel (default: 0.196)
         device: torch device
 
     Returns:
@@ -373,7 +373,7 @@ def compose_camera_to_satellite_transform(
     T_velo_to_imu: torch.Tensor,
     T_imu_to_world: torch.Tensor,
     sat_size: int = 512,
-    resolution_m_per_px: float = 0.2
+    resolution_m_per_px: float = 0.196
 ) -> torch.Tensor:
     """
     Compose full transformation from Camera to Satellite image coordinates.
@@ -413,4 +413,3 @@ def invert_se3(T: torch.Tensor) -> torch.Tensor:
     Tout[:3, :3] = R_inv
     Tout[:3, 3] = t_inv
     return Tout
-
