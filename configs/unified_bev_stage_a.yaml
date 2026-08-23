@@ -1,0 +1,20 @@
+# First implementation target from todo/kitti360_unified_bev_latent_implementation_spec.md
+data:
+  manifest: dataset_splits/kitti360_geofence_buffer30/val_manifest.jsonl
+  lidar_root: /media/shizhm/sda2/KITTI360_lidar/data_3d_raw
+  tile_size_m: 64.0
+  bev_resolution_m: 0.5
+  dense_source_count: 16
+  image_size: [160, 96]       # probe size; increase after Stage-A gate
+  max_points_per_view: 2048
+  satellite_m_per_px: 0.196
+model:
+  latent_channels: 64
+  renderer_samples: 24
+train:
+  device: cuda
+  batch_size: 1
+  steps: 20000
+  lr: 0.0002
+  num_workers: 0
+  out: runs/unified_bev_stage_a
