@@ -414,3 +414,58 @@ def test_heightmap_prior_contract_and_cross_attention():
         pass
     else:
         raise AssertionError("mismatched tile size must be rejected")
+
+
+def test_dense_lift_unprojection_roundtrip():
+    """v2 lift geometry: project known world points through a synthetic pinhole,
+    unproject the z-depth map, recover the same points."""
+    from world3d.unified_bev.models import unproject_dense
+    torch.manual_seed(0)
+    fx, cx, cy = 200.0, 80.0, 48.0
+    K = torch.tensor([[[fx, 0, cx], [0, fx, cy], [0, 0, 1.0]]])
+    T = torch.eye(4).view(1, 1, 4, 4)
+    T[0, 0, 2, 3] = 1.5  # camera 1.5m above ground, looking +z
+    pts = torch.tensor([
+        [0.0, 0.0, 10.0], [-3.0, 0.5, 15.0], [4.0, -1.0, 20.0], [1.0, 2.0, 30.0],
+    ])
+    cam = pts.clone(); cam[:, 2] -= 1.5  # world->cam: camera sits 1.5m above (z offset)
+    u = cam[:, 0] / cam[:, 2] * fx + cx
+    v = cam[:, 1] / cam[:, 2] * fx + cy
+    H, W = 96, 160
+    depth = torch.zeros(1, 1, H, W)
+    ui = u.round().long().clamp(0, W - 1); vi = v.round().long().clamp(0, H - 1)
+    depth[0, 0, vi, ui] = cam[:, 2]
+    rec = unproject_dense(depth, K.expand(1, 1, 3, 3), T)[0, 0]
+    for k in range(pts.shape[0]):
+        got = rec[vi[k], ui[k]]
+        # sub-pixel quantization: nearest-pixel rounding at fx=200 is ~4cm at 15m
+        assert torch.allclose(got, pts[k], atol=0.1), (k, got, pts[k])
+
+
+def test_dense_encoder_shapes_and_coverage():
+    from world3d.unified_bev.models import GroundDenseBEVEncoder
+    torch.manual_seed(0)
+    enc = GroundDenseBEVEncoder(latent_channels=8, bev_height=16, bev_width=16)
+    B, N, H, W = 1, 2, 12, 20
+    images = torch.rand(B, N, 3, H, W)
+    fx = 15.0
+    K = torch.tensor([[[fx, 0, W / 2], [0, fx, H / 2], [0, 0, 1.0]]]).expand(B, N, 3, 3)
+    # Camera looks along world +y (horizontal), 1.5m above ground: pixel rays
+    # spread over the BEV (x, y) plane as depth varies.
+    T = torch.zeros(B, N, 4, 4)
+    T[..., 0, 0] = 1.0
+    T[..., 1, 2] = 1.0   # cam z -> world y
+    T[..., 2, 1] = -1.0  # cam y -> world -z
+    T[..., 3, 3] = 1.0
+    T[..., 1, 3] = 1.5
+    rows = torch.linspace(2.0, 32.0, H).view(1, 1, H, 1).expand(B, N, H, W)
+    depth = rows.clone()                     # nearer rows (bottom) to far rows
+    conf = torch.ones(B, N, H, W)
+    origin = torch.tensor([[-16.0, 2.0]])  # tile y in [2, 34]: matches the 2..33.5m point span
+    z, cov = enc(images, K, depth, conf, T, origin, 2.0)
+    assert z.shape == (B, 8, 16, 16)
+    assert float(cov.mean()) > 0.3, "a 10m wall ahead should cover many cells"
+    # low-confidence pixels must be excluded
+    conf2 = torch.zeros_like(conf)
+    _, cov2 = enc(images, K, depth, conf2, T, origin, 2.0)
+    assert float(cov2.mean()) == 0.0

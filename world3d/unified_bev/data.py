@@ -410,3 +410,36 @@ def load_cached_unified_bev(path):
             "__getitem__": lambda self, i: _storage_to_sample(samples[i]),
         })
     return ds
+
+
+def load_dense_cached_unified_bev(sample_cache: str, m3d_cache: str):
+    """Sample cache joined with the Metric3D dense-depth cache by index.
+
+    Returns a Dataset whose items additionally carry ``dense_depth`` and
+    ``dense_conf`` (N,96,160, float32) aligned with ``source_rgb`` views.
+    """
+    import os
+    from torch.utils.data import Dataset as _Dataset
+
+    base = load_cached_unified_bev(sample_cache)
+
+    class _DensePair(_Dataset):
+        def __init__(self, base, m3d_dir):
+            self.base = base
+            self.m3d_dir = m3d_dir
+
+        def __len__(self):
+            return len(self.base)
+
+        def __getitem__(self, idx):
+            s = self.base[idx]
+            blob = torch.load(os.path.join(self.m3d_dir, f"{idx:06d}.pt"),
+                              map_location="cpu", weights_only=False)
+            s["dense_depth"] = blob["depth"].float()
+            s["dense_conf"] = blob["conf"].float()
+            return s
+
+        def __getattr__(self, name):
+            return getattr(self.base, name)
+
+    return _DensePair(base, m3d_cache)

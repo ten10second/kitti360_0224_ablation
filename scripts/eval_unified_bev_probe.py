@@ -23,6 +23,7 @@ from world3d.unified_bev.data import SAT_M_PER_PX, UnifiedBEVDataset, _open_imag
 from world3d.unified_bev.geometry import bilinear_splat, height_statistics
 from world3d.unified_bev.models import (
     ColumnFieldDecoder,
+    GroundDenseBEVEncoder,
     GroundBEVEncoder,
     HeightMapSatellitePrior,
     LatentCompletion,
@@ -207,6 +208,7 @@ def main():
                     help="report nadir round-trip distance of each latent branch vs the satellite crop")
     ap.add_argument("--eval_ssim_lpips", action="store_true",
                     help="report SSIM and LPIPS(alex) for every render branch")
+    ap.add_argument("--m3d_cache", default=None, help="Metric3D depth cache dir aligned with this eval split (enables dense lift)")
     ap.add_argument("--records_out", default=None)
     args = ap.parse_args()
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
@@ -218,13 +220,18 @@ def main():
     )
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
     headings = road_headings(ds)
+    m3d_blobs = None
+    if args.m3d_cache:
+        m3d_blobs = [torch.load(Path(args.m3d_cache) / f"{i:06d}.pt", map_location="cpu", weights_only=False)
+                     for i in range(len(ds))]
     lpips_net = None
     if args.eval_ssim_lpips:
         import lpips
         lpips_net = lpips.LPIPS(net="alex").to(device)
         lpips_net.eval()
     a = torch.load(args.stage_a, map_location=device, weights_only=False)
-    ground = GroundBEVEncoder(bev_height=ds.bev_size, bev_width=ds.bev_size).to(device)
+    ground = (GroundDenseBEVEncoder(bev_height=ds.bev_size, bev_width=ds.bev_size)
+              if args.m3d_cache else GroundBEVEncoder(bev_height=ds.bev_size, bev_width=ds.bev_size)).to(device)
     decoder = ColumnFieldDecoder(
         hidden=a.get("config", {}).get("hidden", 128),
         samples=a.get("config", {}).get("ray_samples", 24),
@@ -282,16 +289,31 @@ def main():
         for batch in loader:
             batch = {k: v.to(device) if torch.is_tensor(v) else v for k, v in batch.items()}
             batch_size = batch["target_rgb"].shape[0]
-            z_star, ref_mask = ground(
-                batch["source_rgb"], batch["source_points_world"], batch["source_points_uv"],
-                batch["source_points_valid"], batch["origin_xy"], ds.bev_resolution_m,
-            )
+            if m3d_blobs is not None:
+                blob = m3d_blobs[sample_offset]
+                dense_depth = blob["depth"].unsqueeze(0).to(device)
+                dense_conf = blob["conf"].unsqueeze(0).to(device)
+                if dense_depth.shape[0] != batch["source_rgb"].shape[0]:
+                    dense_depth = dense_depth.expand(batch["source_rgb"].shape[0], -1, -1, -1)
+                    dense_conf = dense_conf.expand(batch["source_rgb"].shape[0], -1, -1, -1)
+                batch["dense_depth"], batch["dense_conf"] = dense_depth, dense_conf
+
+            def _lift(sl):
+                if m3d_blobs is not None:
+                    return ground(
+                        batch["source_rgb"][:, sl], batch["source_K"][:, sl],
+                        batch["dense_depth"][:, sl], batch["dense_conf"][:, sl],
+                        batch["source_T_world_cam"][:, sl],
+                        batch["origin_xy"], ds.bev_resolution_m,
+                    )
+                return ground(
+                    batch["source_rgb"][:, sl], batch["source_points_world"][:, sl],
+                    batch["source_points_uv"][:, sl], batch["source_points_valid"][:, sl],
+                    batch["origin_xy"], ds.bev_resolution_m,
+                )
+            z_star, ref_mask = _lift(slice(None))
             sp = slice(0, args.sparse_sources * ds.views_per_frame)
-            z_sparse, sparse_mask = ground(
-                batch["source_rgb"][:, sp], batch["source_points_world"][:, sp],
-                batch["source_points_uv"][:, sp], batch["source_points_valid"][:, sp],
-                batch["origin_xy"], ds.bev_resolution_m,
-            )
+            z_sparse, sparse_mask = _lift(sp)
             height_metrics = None
             if have_b:
                 if uses_satellite:

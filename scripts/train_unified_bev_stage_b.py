@@ -14,11 +14,12 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from world3d.unified_bev.data import UnifiedBEVDataset
+from world3d.unified_bev.data import UnifiedBEVDataset, load_dense_cached_unified_bev
 from world3d.unified_bev.data import load_cached_unified_bev
 from world3d.unified_bev.geometry import bilinear_splat, height_statistics
 from world3d.unified_bev.models import (
     ColumnFieldDecoder,
+    GroundDenseBEVEncoder,
     GroundBEVEncoder,
     LatentCompletion,
     HeightMapSatellitePrior,
@@ -80,6 +81,7 @@ def main():
     ap.add_argument("--nadir_top_m", type=float, default=48.0)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--cache", default=None, help="prebuilt sample cache; serving from RAM, workers forced to 0")
+    ap.add_argument("--m3d_cache", default=None, help="Metric3D dense cache; switches lift to dense (Stage A must be dense too)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
@@ -89,12 +91,17 @@ def main():
     rng = random.Random(args.seed)
     torch.manual_seed(args.seed)
     ckpt = torch.load(args.stage_a, map_location=device, weights_only=False)
-    ds = (load_cached_unified_bev(args.cache) if args.cache else UnifiedBEVDataset(
+    if args.cache and args.m3d_cache:
+        ds = load_dense_cached_unified_bev(args.cache, args.m3d_cache)
+    elif args.cache:
+        ds = load_cached_unified_bev(args.cache)
+    else:
+        ds = UnifiedBEVDataset(
         args.manifest, lidar_root=args.lidar_root, dense_source_count=args.dense_sources,
         sparse_source_count=max(source_choices), image_size=(args.image_width, args.image_height),
         max_points_per_view=args.max_points, max_samples=args.max_samples, drive=args.drive,
         min_target_spacing_m=args.min_target_spacing_m,
-    ))
+        )
     if args.cache:
         args.num_workers = 0  # RAM serving; forked workers would copy the cache
     loader = DataLoader(
@@ -102,7 +109,8 @@ def main():
         drop_last=True, persistent_workers=args.num_workers > 0,
         generator=torch.Generator().manual_seed(args.seed),
     )
-    ground = GroundBEVEncoder(bev_height=ds.bev_size, bev_width=ds.bev_size).to(device)
+    ground_cls = GroundDenseBEVEncoder if args.m3d_cache else GroundBEVEncoder
+    ground = ground_cls(bev_height=ds.bev_size, bev_width=ds.bev_size).to(device)
     decoder = ColumnFieldDecoder(hidden=args.hidden, samples=args.ray_samples).to(device)
     ground.load_state_dict(ckpt["ground"])
     decoder.load_state_dict(ckpt["decoder"])
@@ -152,16 +160,21 @@ def main():
         batch = move_batch(batch, device)
         n_sparse = rng.choice(source_choices)
         with torch.no_grad():
-            z_star, ref_mask = ground(
-                batch["source_rgb"], batch["source_points_world"], batch["source_points_uv"],
-                batch["source_points_valid"], batch["origin_xy"], ds.bev_resolution_m,
-            )
+            def _lift(rgb, sl):
+                if args.m3d_cache:
+                    return ground(
+                        rgb[:, sl], batch["source_K"][:, sl], batch["dense_depth"][:, sl],
+                        batch["dense_conf"][:, sl], batch["source_T_world_cam"][:, sl],
+                        batch["origin_xy"], ds.bev_resolution_m,
+                    )
+                return ground(
+                    rgb[:, sl], batch["source_points_world"][:, sl],
+                    batch["source_points_uv"][:, sl], batch["source_points_valid"][:, sl],
+                    batch["origin_xy"], ds.bev_resolution_m,
+                )
+            z_star, ref_mask = _lift(batch["source_rgb"], slice(None))
             sparse = slice(0, n_sparse * ds.views_per_frame)
-            z_sparse, sparse_mask = ground(
-                batch["source_rgb"][:, sparse], batch["source_points_world"][:, sparse],
-                batch["source_points_uv"][:, sparse], batch["source_points_valid"][:, sparse],
-                batch["origin_xy"], ds.bev_resolution_m,
-            )
+            z_sparse, sparse_mask = _lift(batch["source_rgb"], sparse)
         # The coordinate-only B3 control must not consume satellite pixels at
         # all.  Its prior is a fixed relative-XY buffer inside completion.
         height_loss = z_sparse.new_tensor(0.0)

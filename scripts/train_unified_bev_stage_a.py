@@ -19,9 +19,8 @@ from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from world3d.unified_bev.data import UnifiedBEVDataset
-from world3d.unified_bev.data import load_cached_unified_bev
-from world3d.unified_bev.models import ColumnFieldDecoder, GroundBEVEncoder
+from world3d.unified_bev.data import UnifiedBEVDataset, load_cached_unified_bev, load_dense_cached_unified_bev
+from world3d.unified_bev.models import ColumnFieldDecoder, GroundBEVEncoder, GroundDenseBEVEncoder
 
 
 def move_batch(batch, device):
@@ -49,6 +48,7 @@ def main():
     ap.add_argument("--weight_decay", type=float, default=0.0)
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--cache", default=None, help="prebuilt sample cache; serving from RAM, workers forced to 0")
+    ap.add_argument("--m3d_cache", default=None, help="Metric3D dense-depth cache dir (enables dense lift)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", default=None, help="checkpoint to resume from")
     args = ap.parse_args()
@@ -57,12 +57,17 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
 
-    ds = (load_cached_unified_bev(args.cache) if args.cache else UnifiedBEVDataset(
-        args.manifest, lidar_root=args.lidar_root, dense_source_count=args.dense_sources,
-        sparse_source_count=2, image_size=(args.image_width, args.image_height),
-        max_points_per_view=args.max_points, max_samples=args.max_samples, drive=args.drive,
-        min_target_spacing_m=args.min_target_spacing_m,
-    ))
+    if args.cache and args.m3d_cache:
+        ds = load_dense_cached_unified_bev(args.cache, args.m3d_cache)
+    elif args.cache:
+        ds = load_cached_unified_bev(args.cache)
+    else:
+        ds = UnifiedBEVDataset(
+            args.manifest, lidar_root=args.lidar_root, dense_source_count=args.dense_sources,
+            sparse_source_count=2, image_size=(args.image_width, args.image_height),
+            max_points_per_view=args.max_points, max_samples=args.max_samples, drive=args.drive,
+            min_target_spacing_m=args.min_target_spacing_m,
+        )
     if args.cache:
         args.num_workers = 0  # RAM serving; forked workers would copy the cache
     loader = DataLoader(
@@ -70,7 +75,10 @@ def main():
         drop_last=True, persistent_workers=args.num_workers > 0,
         generator=torch.Generator().manual_seed(args.seed),
     )
-    ground = GroundBEVEncoder(bev_height=ds.bev_size, bev_width=ds.bev_size).to(device)
+    if args.m3d_cache:
+        ground = GroundDenseBEVEncoder(bev_height=ds.bev_size, bev_width=ds.bev_size).to(device)
+    else:
+        ground = GroundBEVEncoder(bev_height=ds.bev_size, bev_width=ds.bev_size).to(device)
     decoder = ColumnFieldDecoder(hidden=args.hidden, samples=args.ray_samples).to(device)
     opt = torch.optim.AdamW(list(ground.parameters()) + list(decoder.parameters()), lr=args.lr, weight_decay=args.weight_decay)
     print(f"[stage-a] device={device} samples={len(ds)} bev={ds.bev_size}x{ds.bev_size} mpp=0.196")
@@ -91,10 +99,17 @@ def main():
             iterator = iter(loader)
             batch = next(iterator)
         batch = move_batch(batch, device)
-        z_star, coverage = ground(
-            batch["source_rgb"], batch["source_points_world"], batch["source_points_uv"],
-            batch["source_points_valid"], batch["origin_xy"], ds.bev_resolution_m,
-        )
+        if args.m3d_cache:
+            z_star, coverage = ground(
+                batch["source_rgb"], batch["source_K"], batch["dense_depth"],
+                batch["dense_conf"], batch["source_T_world_cam"],
+                batch["origin_xy"], ds.bev_resolution_m,
+            )
+        else:
+            z_star, coverage = ground(
+                batch["source_rgb"], batch["source_points_world"], batch["source_points_uv"],
+                batch["source_points_valid"], batch["origin_xy"], ds.bev_resolution_m,
+            )
         pred_rgb, pred_depth, _ = decoder.render(
             z_star, batch["target_K"], batch["target_T_world_cam"], batch["origin_xy"],
             tile_size_m=ds.tile_size_m, image_size=ds.image_size,

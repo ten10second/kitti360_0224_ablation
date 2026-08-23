@@ -30,6 +30,116 @@ class ImageFeatureEncoder(nn.Module):
         return self.net(x)
 
 
+def unproject_dense(depth: torch.Tensor, K: torch.Tensor, T_world_cam: torch.Tensor) -> torch.Tensor:
+    """Per-pixel unprojection of z-depth maps to world points.
+
+    ``depth``: (B,N,H,W) metric z-depth along each view's optical axis;
+    ``K``: (B,N,3,3) intrinsics matching that pixel grid (anisotropic K is
+    exactly consistent with axis-resized images, so the cached 96x160 views
+    unproject exactly); ``T_world_cam``: (B,N,4,4).  Returns (B,N,H,W,3).
+    """
+    B, N, H, W = depth.shape
+    device, dtype = depth.device, depth.dtype
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device, dtype=dtype) + 0.5,
+        torch.arange(W, device=device, dtype=dtype) + 0.5, indexing="ij")
+    pix = torch.stack([xx, yy, torch.ones_like(xx)], dim=-1).view(1, 1, H * W, 3)
+    Kinv = torch.linalg.inv(K.to(dtype))
+    rays = pix @ Kinv.transpose(-1, -2)            # (B,N,P,3) = (x/z, y/z, 1)
+    pts_cam = rays * depth.view(B, N, H * W, 1)
+    R = T_world_cam[..., :3, :3].to(dtype)
+    t = T_world_cam[..., None, :3, 3].to(dtype)
+    pts_w = pts_cam @ R.transpose(-1, -2) + t
+    return pts_w.view(B, N, H, W, 3)
+
+
+class GroundDenseBEVEncoder(nn.Module):
+    """v2 lift: every camera pixel carrying Metric3D metric depth is a world
+    point.
+
+    Replaces the LiDAR-point-sampled lift (whose ~1k points/view left ~80% of
+    the BEV unmeasured at Ns=1 and made z_gnd chain-dependent -- the C2
+    verdict).  Here each view contributes its full pixel grid: features come
+    from the shared image encoder at EVERY pixel, points from per-pixel
+    unprojection of the scale-anchored M3D depth cache, gated by M3D
+    confidence and physical depth bounds.  Multi-view agreement is resolved
+    by the splat's weighted mean; h_var records disagreement as uncertainty.
+    Output contract matches ``GroundBEVEncoder`` (z, coverage).
+    """
+
+    def __init__(self, latent_channels: int = 64, bev_height: int = 128, bev_width: int = 128,
+                 context_blocks: int = 4, conf_threshold: float = 0.3,
+                 min_depth_m: float = 0.5, max_depth_m: float = 60.0):
+        super().__init__()
+        self.latent_channels = latent_channels
+        self.bev_height = bev_height
+        self.bev_width = bev_width
+        self.conf_threshold = conf_threshold
+        self.min_depth_m = min_depth_m
+        self.max_depth_m = max_depth_m
+        self.image_encoder = ImageFeatureEncoder(latent_channels)
+        in_ch = latent_channels + 4
+        self.stem = nn.Sequential(
+            nn.Conv2d(in_ch, latent_channels, 3, padding=1),
+            nn.GroupNorm(8, latent_channels), nn.GELU(),
+        )
+        self.blocks = nn.ModuleList()
+        for _ in range(context_blocks):
+            self.blocks.append(nn.Sequential(
+                nn.Conv2d(latent_channels, latent_channels, 3, padding=1),
+                nn.GroupNorm(8, latent_channels), nn.GELU(),
+                nn.Conv2d(latent_channels, latent_channels, 3, padding=1),
+                nn.GroupNorm(8, latent_channels),
+            ))
+        self.out = nn.Sequential(nn.GELU(), nn.Conv2d(latent_channels, latent_channels, 3, padding=1))
+
+    def forward(
+        self,
+        images: torch.Tensor,
+        K: torch.Tensor,
+        dense_depth: torch.Tensor,
+        dense_conf: torch.Tensor,
+        T_world_cam: torch.Tensor,
+        origin_xy: torch.Tensor,
+        resolution_m: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, N, _, H, W = images.shape
+        P = H * W
+        # Guard against pathological M3D outputs (inf/negative depths on
+        # padded borders, negative confidence): neutralize BEFORE unprojection
+        # so invalid coordinates never reach the splat index math.
+        dense_depth = torch.nan_to_num(dense_depth, nan=0.0, posinf=0.0, neginf=0.0)
+        dense_conf = torch.nan_to_num(dense_conf, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
+        feat = self.image_encoder(images.reshape(B * N, 3, H, W))
+        # The shared feature encoder downsamples (stride 2 twice); lift pairs
+        # features with per-pixel depth, so resample back to full resolution.
+        if feat.shape[-2:] != (H, W):
+            feat = F.interpolate(feat, size=(H, W), mode="bilinear", align_corners=False)
+        C = feat.shape[1]
+        feat = feat.view(B, N, C, P).transpose(2, 3)          # (B,N,P,C)
+        pts_w = unproject_dense(dense_depth, K, T_world_cam)  # (B,N,H,W,3)
+        pts = pts_w.view(B, N, P, 3)
+        gate = ((dense_conf > self.conf_threshold)
+                & (dense_depth > self.min_depth_m)
+                & (dense_depth < self.max_depth_m)).view(B, N, P)
+        bev, count = bilinear_splat(
+            feat, pts[..., :2], gate,
+            origin_xy=origin_xy, resolution_m=resolution_m,
+            height=self.bev_height, width=self.bev_width,
+        )
+        h_mean, h_var = height_statistics(
+            pts, gate, origin_xy, resolution_m, self.bev_height, self.bev_width,
+        )
+        coverage = (count > 0).to(bev.dtype)
+        x = torch.cat([bev, coverage, h_mean * coverage, h_var * coverage,
+                       (count + 1).log() / 5.0], dim=1)
+        z = self.stem(x)
+        for block in self.blocks:
+            z = z + block(z)
+        z = self.out(z)
+        return z, coverage
+
+
 class GroundBEVEncoder(nn.Module):
     """Lift sparse metric LiDAR-supported image features into a canonical BEV."""
 
