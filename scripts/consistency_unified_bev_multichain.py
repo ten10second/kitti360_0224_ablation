@@ -111,8 +111,8 @@ def main():
         with torch.no_grad():
             if m3d_blobs is not None:
                 blob = m3d_blobs[bi]
-                dd = blob["depth"].unsqueeze(0).to(device)
-                dc = blob["conf"].unsqueeze(0).to(device)
+                dd = blob["depth"].unsqueeze(0).to(device).float()
+                dc = blob["conf"].unsqueeze(0).to(device).float()
                 z_gnd, cov = ground(
                     batch["source_rgb"][:, sl], batch["source_K"][:, sl],
                     dd[:, sl], dc[:, sl], batch["source_T_world_cam"][:, sl],
@@ -138,7 +138,7 @@ def main():
                 blob = m3d_blobs[bi]
                 z_star, _ = ground(
                     batch["source_rgb"], batch["source_K"],
-                    blob["depth"].unsqueeze(0).to(device), blob["conf"].unsqueeze(0).to(device),
+                    blob["depth"].unsqueeze(0).to(device).float(), blob["conf"].unsqueeze(0).to(device).float(),
                     batch["source_T_world_cam"], batch["origin_xy"], ds.bev_resolution_m,
                 )
             else:

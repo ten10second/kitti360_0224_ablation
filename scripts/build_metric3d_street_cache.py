@@ -43,22 +43,34 @@ STD = torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1)
 IN_H, IN_W = 616, 1064
 
 
-def m3d_run(m3d, img01: torch.Tensor, fx: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """One M3D call on a [0,1] (1,3,h,w) GPU tensor; returns (z-depth, conf) at (h,w)."""
-    _, _, h, w = img01.shape
+def m3d_run(m3d, img01: torch.Tensor, fx, max_batch: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
+    """M3D on a [0,1] (B,3,h,w) GPU batch of same-size images -> (z-depth, conf) (B,h,w).
+
+    Batched inference: ViT-S activations scale linearly with batch (no
+    cross-image attention), so batching same-size views multiplies GPU
+    utilization ~10x at negligible memory cost on a 24GB card."""
+    B, _, h, w = img01.shape
     scale = min(IN_H / h, IN_W / w)
     nh, nw = int(h * scale), int(w * scale)
-    x = F.interpolate(img01, size=(nh, nw), mode="bilinear", align_corners=False) * 255.0
-    ph0, pw0 = (IN_H - nh) // 2, (IN_W - nw) // 2
-    xp = torch.zeros(1, 3, IN_H, IN_W, device=img01.device)
-    xp[:, :, ph0:ph0 + nh, pw0:pw0 + nw] = x
-    with torch.no_grad():
-        d, c, _ = m3d.inference({"input": (xp - MEAN.to(img01.device)) / STD.to(img01.device)})
-    d = d[0, 0, ph0:ph0 + nh, pw0:pw0 + nw]
-    c = c[0, 0, ph0:ph0 + nh, pw0:pw0 + nw]
-    d = F.interpolate(d[None, None], size=(h, w), mode="bilinear")[0, 0]
-    c = F.interpolate(c[None, None], size=(h, w), mode="bilinear")[0, 0]
-    return d * (fx * scale / 1000.0), c
+    ds, cs = [], []
+    for b0 in range(0, B, max_batch):
+        chunk = img01[b0:b0 + max_batch]
+        n = chunk.shape[0]
+        x = F.interpolate(chunk, size=(nh, nw), mode="bilinear", align_corners=False) * 255.0
+        ph0, pw0 = (IN_H - nh) // 2, (IN_W - nw) // 2
+        xp = torch.zeros(n, 3, IN_H, IN_W, device=chunk.device)
+        xp[:, :, ph0:ph0 + nh, pw0:pw0 + nw] = x
+        with torch.no_grad():
+            d, c, _ = m3d.inference({"input": (xp - MEAN.to(chunk.device)) / STD.to(chunk.device)})
+        ds.append(d[:, 0, ph0:ph0 + nh, pw0:pw0 + nw])
+        cs.append(c[:, 0, ph0:ph0 + nh, pw0:pw0 + nw])
+    d = torch.cat(ds)
+    c = torch.cat(cs)
+    d = F.interpolate(d.unsqueeze(1), size=(h, w), mode="bilinear").squeeze(1)
+    c = F.interpolate(c.unsqueeze(1), size=(h, w), mode="bilinear").squeeze(1)
+    if not torch.is_tensor(fx):
+        fx = torch.full((B,), float(fx), device=d.device)
+    return d * (fx.view(-1, 1, 1) * scale / 1000.0), c
 
 
 def main():
@@ -73,6 +85,7 @@ def main():
     ap.add_argument("--eval_split", action="store_true", help="build from eval manifest/drive instead of the sample cache")
     ap.add_argument("--drive", default="2013_05_28_drive_0003_sync")
     ap.add_argument("--max_samples", type=int, default=32)
+    ap.add_argument("--lidar_root", default="/media/shizhm/sda2/KITTI360_lidar/data_3d_raw")
     args = ap.parse_args()
     device = torch.device(args.device)
     out_dir = Path(args.out)
@@ -118,7 +131,71 @@ def main():
         conf = torch.zeros(n_views, 96, 160)
         scale = torch.ones(n_views)
 
-        for v in range(n_views):
+        # ---- pass 1: all fisheye virtual views in ONE batched call ----
+        fish_idx = [v for v in range(n_views) if v % vpf != 0]
+        if fish_idx:
+            fish_imgs = torch.stack([s["source_rgb"][v] for v in fish_idx]).to(device)
+            fish_fx = torch.tensor([float(s["source_K"][v][0, 0]) for v in fish_idx], device=device)
+            d_all, c_all = m3d_run(m3d, fish_imgs, fish_fx)
+            for k, v in enumerate(fish_idx):
+                valid = s["source_points_valid"][v]
+                uv = s["source_points_uv"][v][valid]
+                pw = s["source_points_world"][v][valid]
+                T = s["source_T_world_cam"][v]
+                R, t = T[:3, :3], T[:3, 3]
+                z_cam = ((pw - t) @ R)[:, 2]
+                px = uv[:, 0].round().long().clamp(0, 159)
+                py = uv[:, 1].round().long().clamp(0, 95)
+                d_v = d_all[k].cpu(); c_v = c_all[k].cpu()
+                dv_pts = d_v[py, px]
+                msk = (z_cam > 0.5) & (dv_pts > 0.05) & (c_v[py, px] > 0.05)
+                if int(msk.sum()) > 50:
+                    sc = float((z_cam[msk] / dv_pts[msk]).median())
+                    if 0.3 < sc < 4.0:
+                        d_v = d_v * sc
+                        scale[v] = sc
+                depth[v] = d_v.clamp(0.0, 60.0).to(torch.float16).float()
+                conf[v] = c_v.clamp(min=0.0).to(torch.float16).float()
+
+        # ---- pass 2: perspective frames, crops batched per frame ----
+        for f in range(n_views // vpf):
+            v = f * vpf
+            drive = s["meta"]["drive"]
+            drive = drive[0] if isinstance(drive, list) else drive
+            fids = s["meta"]["source_fids"]
+            fid = fids[f]
+            fid = fid[0] if isinstance(fid, list) else fid
+            src_path = paths[(drive, int(fid))]
+            ddir = Path(src_path).parents[2]
+            if drive not in k0_cache:
+                K0 = _read_p_rect_00(ddir / "calibration" / "perspective.txt")
+                k0_cache.clear()
+                k0_cache[drive] = torch.from_numpy(K0.astype(np.float32))
+            K0 = k0_cache[drive]
+            fx0 = float(K0[0, 0])
+            img = torch.from_numpy(
+                np.asarray(Image.open(src_path).convert("RGB"), dtype=np.float32) / 255.0
+            ).permute(2, 0, 1).to(device)
+            H0, W0 = img.shape[-2:]
+            W = args.crop_w
+            step = W - args.crop_overlap
+            starts = list(range(0, max(W0 - W, 0) + 1, step))
+            crops = torch.stack([img[..., x0:x0 + W] for x0 in starts])
+            d_all, c_all = m3d_run(m3d, crops, fx0)
+            strip_d = torch.zeros(H0, W0)
+            strip_c = torch.zeros(H0, W0)
+            strip_w = torch.zeros(H0, W0)
+            for k, x0 in enumerate(starts):
+                d_c, c_c = d_all[k].cpu(), c_all[k].cpu()
+                strip_d[:, x0:x0 + W] += d_c * c_c
+                strip_c[:, x0:x0 + W] += c_c
+                strip_w[:, x0:x0 + W] += 1.0
+            mm = strip_w > 0
+            strip_d[mm] = strip_d[mm] / strip_c[mm]
+            strip_c[mm] = strip_c[mm] / strip_w[mm]
+            d_v = F.interpolate(strip_d[None, None], size=(96, 160), mode="bilinear")[0, 0]
+            c_v = F.interpolate(strip_c[None, None], size=(96, 160), mode="bilinear")[0, 0]
+
             valid = s["source_points_valid"][v]
             uv = s["source_points_uv"][v][valid]
             pw = s["source_points_world"][v][valid]
@@ -127,53 +204,11 @@ def main():
             z_cam = ((pw - t) @ R)[:, 2]
             px = uv[:, 0].round().long().clamp(0, 159)
             py = uv[:, 1].round().long().clamp(0, 95)
-
-            if v % vpf == 0:
-                # perspective: original resolution + standard-aspect crops
-                drive = s["meta"]["drive"][0] if isinstance(s["meta"]["drive"], list) else s["meta"]["drive"]
-                fids = s["meta"]["source_fids"]
-                fid = int(fids[v // vpf][0] if isinstance(fids[v // vpf], list) else fids[v // vpf])
-                src = paths[(drive, fid)]
-                ddir = Path(src).parents[2]
-                if drive not in k0_cache:
-                    K0 = _read_p_rect_00(ddir / "calibration" / "perspective.txt")
-                    k0_cache.clear()  # one drive at a time keeps this tiny
-                    k0_cache[drive] = torch.from_numpy(K0.astype(np.float32))
-                K0 = k0_cache[drive]
-                fx0, cx0 = float(K0[0, 0]), float(K0[0, 2])
-                img = torch.from_numpy(
-                    np.asarray(Image.open(src).convert("RGB"), dtype=np.float32) / 255.0
-                ).permute(2, 0, 1).to(device)
-                H0, W0 = img.shape[-2:]
-                W = args.crop_w
-                step = W - args.crop_overlap
-                strip_d = torch.zeros(H0, W0)
-                strip_c = torch.zeros(H0, W0)
-                strip_w = torch.zeros(H0, W0)
-                for x0 in range(0, max(W0 - W, 0) + 1, step):
-                    crop = img[..., x0:x0 + W][None]
-                    d_c, c_c = m3d_run(m3d, crop, fx0)
-                    strip_d[:, x0:x0 + W] += d_c.cpu() * c_c.cpu()
-                    strip_c[:, x0:x0 + W] += c_c.cpu()
-                    strip_w[:, x0:x0 + W] += 1.0
-                m = strip_w > 0
-                strip_d[m] = strip_d[m] / strip_c[m]  # conf-weighted crop merge
-                strip_c[m] = strip_c[m] / strip_w[m]
-                # conf-weighted mean of (d*c) then /c gives mean d weighted by c.
-                d_v = F.interpolate(strip_d[None, None], size=(96, 160), mode="bilinear")[0, 0]
-                c_v = F.interpolate(strip_c[None, None], size=(96, 160), mode="bilinear")[0, 0]
-            else:
-                img = s["source_rgb"][v][None].to(device)
-                fx = float(s["source_K"][v][0, 0])
-                d_v, c_v = m3d_run(m3d, img, fx)
-                d_v, c_v = d_v.cpu(), c_v.cpu()
-
-            # per-view LiDAR scale anchor (one scalar)
             dv_pts = d_v[py, px]
             msk = (z_cam > 0.5) & (dv_pts > 0.05) & (c_v[py, px] > 0.05)
             if int(msk.sum()) > 50:
                 sc = float((z_cam[msk] / dv_pts[msk]).median())
-                if 0.3 < sc < 4.0:  # reject pathological anchors
+                if 0.3 < sc < 4.0:
                     d_v = d_v * sc
                     scale[v] = sc
             depth[v] = d_v.clamp(0.0, 60.0).to(torch.float16).float()

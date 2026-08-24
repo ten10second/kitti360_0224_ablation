@@ -108,6 +108,9 @@ class GroundDenseBEVEncoder(nn.Module):
         # Guard against pathological M3D outputs (inf/negative depths on
         # padded borders, negative confidence): neutralize BEFORE unprojection
         # so invalid coordinates never reach the splat index math.
+        # fp16 cache entries must be promoted before linalg.inv (Half unsupported)
+        dense_depth = dense_depth.float()
+        dense_conf = dense_conf.float()
         dense_depth = torch.nan_to_num(dense_depth, nan=0.0, posinf=0.0, neginf=0.0)
         dense_conf = torch.nan_to_num(dense_conf, nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
         feat = self.image_encoder(images.reshape(B * N, 3, H, W))
