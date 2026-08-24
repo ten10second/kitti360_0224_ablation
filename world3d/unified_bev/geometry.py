@@ -122,6 +122,7 @@ def bilinear_splat(
     resolution_m: float,
     height: int,
     width: int,
+    point_weights: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Splat point values onto a BEV grid with bilinear weights.
 
@@ -157,7 +158,7 @@ def bilinear_splat(
     ):
         xi, yi = x0 + dx, y0 + dy
         ok = valid & (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
-        w = weight * ok.to(dtype)
+        w = weight * ok.to(dtype) if point_weights is None else weight * ok.to(dtype) * point_weights.to(dtype)
         index = (yi.clamp(0, height - 1) * width + xi.clamp(0, width - 1)).reshape(B, -1)
         weighted = (values * w[..., None]).reshape(B, -1, C).transpose(1, 2)
         acc.scatter_add_(2, index[:, None, :].expand(-1, C, -1), weighted)

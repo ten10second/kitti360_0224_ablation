@@ -469,3 +469,51 @@ def test_dense_encoder_shapes_and_coverage():
     conf2 = torch.zeros_like(conf)
     _, cov2 = enc(images, K, depth, conf2, T, origin, 2.0)
     assert float(cov2.mean()) == 0.0
+
+
+def test_cross_view_consistency_weights():
+    """Two views of the same wall: agreeing pixels get full endorsement;
+    a pixel whose depth disagrees with the other view drops toward the
+    outlier floor."""
+    from world3d.unified_bev.models import cross_view_consistency, unproject_dense
+    B, N, H, W = 1, 2, 8, 8
+    fx = 8.0
+    K = torch.tensor([[[fx, 0, W / 2], [0, fx, H / 2], [0, 0, 1.0]]]).expand(B, N, 3, 3).contiguous()
+    T = torch.zeros(B, N, 4, 4)
+    T[..., 0, 0] = 1.0
+    T[..., 1, 2] = 1.0
+    T[..., 2, 1] = -1.0
+    T[..., 3, 3] = 1.0
+    T[:, 1, 1, 3] = 0.0  # second view laterally offset for parallax
+    depth = torch.full((B, N, H, W), 10.0)
+    # one disagreeing pixel in view 0: other view claims 20m there
+    depth_b = depth.clone()
+    depth_b[:, 1, 4, 4] = 20.0
+    conf = torch.ones(B, N, H, W)
+    gate = conf > 0
+    pts = unproject_dense(depth_b, K, T)
+    w = cross_view_consistency(pts, depth_b, K, T, gate)
+    w_ok = w[0, 0, 2, 2]
+    w_bad = w[0, 0, 4, 4]
+    assert w_ok > 0.9, f"agreed pixel should be endorsed, got {w_ok}"
+    assert w_bad < 0.5, f"disagreed pixel should be suppressed, got {w_bad}"
+    assert w_bad >= 0.2 - 1e-6, "floor must hold"
+
+
+def test_splat_point_weights_suppress_outliers():
+    """A cell receiving one endorsed and one hallucinated point should tilt
+    toward the endorsed point's value when point_weights are used."""
+    from world3d.unified_bev.geometry import bilinear_splat
+    vals = torch.tensor([[[[5.0], [50.0]]]])            # (B=1,N=1,P=2,C=1)
+    xy = torch.tensor([[[[1.25, 1.75], [1.75, 1.75]]]])  # both near same cell
+    valid = torch.ones(1, 1, 2, dtype=torch.bool)
+    org = torch.zeros(1, 2)
+    base, _ = bilinear_splat(vals, xy, valid, origin_xy=org, resolution_m=1.0, height=4, width=4)
+    wgt = torch.tensor([[[[1.0, 0.01]]]])
+    weighted, _ = bilinear_splat(vals, xy, valid, origin_xy=org, resolution_m=1.0,
+                                 height=4, width=4, point_weights=wgt)
+    # unweighted mean ~27.5; weighted should sit near 5
+    assert float(weighted.abs().mean()) < float(base.abs().mean())
+    c = 2
+    got = weighted[0, 0, 1, 1]  # main bilinear cell for both points
+    assert 4.0 < float(got) < 10.0, float(got)

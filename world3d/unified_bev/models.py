@@ -125,10 +125,17 @@ class GroundDenseBEVEncoder(nn.Module):
         gate = ((dense_conf > self.conf_threshold)
                 & (dense_depth > self.min_depth_m)
                 & (dense_depth < self.max_depth_m)).view(B, N, P)
+        # Cross-view endorsement (MVS visibility check): suppresses per-view
+        # M3D disagreement before it becomes chain-level bias (C2 reversal).
+        cons = cross_view_consistency(
+            pts_w, dense_depth, K, T_world_cam,
+            gate.view(B, N, H, W),
+        ).view(B, N, P)
         bev, count = bilinear_splat(
             feat, pts[..., :2], gate,
             origin_xy=origin_xy, resolution_m=resolution_m,
             height=self.bev_height, width=self.bev_width,
+            point_weights=cons,
         )
         h_mean, h_var = height_statistics(
             pts, gate, origin_xy, resolution_m, self.bev_height, self.bev_width,
@@ -255,6 +262,70 @@ def satellite_bev_crop(
     # BEV raster is south-up, so flip rows before resampling.
     crop = torch.flip(crop, dims=[-2])
     return F.interpolate(crop, size=(size, size), mode="bilinear", align_corners=False)
+
+
+def cross_view_consistency(
+    pts_w: torch.Tensor,
+    depth_maps: torch.Tensor,
+    K: torch.Tensor,
+    T_world_cam: torch.Tensor,
+    gate: torch.Tensor,
+    rel_tol: float = 0.15,
+    outlier_floor: float = 0.2,
+) -> torch.Tensor:
+    """Per-point cross-view endorsement weight, classical-MVS visibility check.
+
+    For every lifted pixel point of view i, project it into each other view j
+    and compare view j's predicted depth there with the point's own axial
+    distance.  Weight = fraction of in-bounds gated views agreeing within
+    ``rel_tol``; points no other view can see keep ``outlier_floor + 0.5`` so
+    genuine single-view surfaces (occlusion boundaries) survive with reduced
+    weight while M3D's per-view hallucinations get suppressed.  This is the
+    cheap consistency mechanism whose absence the dense-lift C2 reversal
+    exposed (chains averaged disagreeing dense measurements).
+
+    pts_w: (B,N,H,W,3); depth_maps/gate: (B,N,H,W); K: (B,N,3,3);
+    T_world_cam: (B,N,4,4).  Returns weights (B,N,H,W).
+    """
+    B, N, H, W = depth_maps.shape
+    device = depth_maps.device
+    dtype = torch.float32
+    pts = pts_w.to(dtype).reshape(B, N, H * W, 3)          # (B,Ni,P,3)
+    dd = depth_maps.to(dtype)
+    votes = torch.zeros(B, N, H * W, dtype=dtype, device=device)
+    voters = torch.zeros(B, N, H * W, dtype=dtype, device=device)
+    view_range = torch.arange(N, device=device)
+    for j in range(N):
+        if N > 1:
+            not_self = (view_range != j).view(1, N, 1).expand(B, N, H * W)
+        else:
+            not_self = torch.ones(B, N, H * W, dtype=torch.bool, device=device)
+        Kj = K[:, j].to(dtype)
+        Rj = T_world_cam[:, j, :3, :3].to(dtype)
+        tj = T_world_cam[:, j, :3, 3].to(dtype)
+        # p_world = R p_cam + t  =>  p_cam = (p_world - t) @ R
+        p_cam = ((pts - tj.view(B, 1, 1, 3)) @ Rj.view(B, 1, 3, 3))  # (B,Ni,P,3)
+        z = p_cam[..., 2]
+        front = z > 0.5
+        zc = z.clamp_min(1e-6)
+        u = p_cam[..., 0] / zc * Kj[:, 0, 0].view(B, 1, 1) + Kj[:, 0, 2].view(B, 1, 1) - 0.5
+        v = p_cam[..., 1] / zc * Kj[:, 1, 1].view(B, 1, 1) + Kj[:, 1, 2].view(B, 1, 1) - 0.5
+        ui = u.round().long()
+        vi = v.round().long()
+        inb = (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H) & front
+        flat = (vi.clamp(0, H - 1) * W + ui.clamp(0, W - 1))          # (B,Ni,P)
+        idx = flat + (j * H * W) + torch.arange(B, device=device)[:, None, None] * (N * H * W)
+        d_j = dd.reshape(B * N * H * W)[idx.clamp(0, B * N * H * W - 1)]
+        g_j = gate[:, j].reshape(B, 1, H * W).expand(B, N, H * W).to(dtype)
+        valid = inb & (g_j > 0) & not_self
+        agree = valid & ((z - d_j).abs() / z.clamp_min(0.5) < rel_tol)
+        votes = votes + agree.to(dtype)
+        voters = voters + valid.to(dtype)
+    endorse = votes / voters.clamp_min(1.0)
+    weight = outlier_floor + (1.0 - outlier_floor) * endorse
+    unseen = voters == 0
+    weight = torch.where(unseen, torch.full_like(weight, outlier_floor + 0.5), weight)
+    return weight.view(B, N, H, W)
 
 
 def nadir_distance(pred: torch.Tensor, ref: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
