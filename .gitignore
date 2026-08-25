@@ -6,3 +6,7 @@ debug_output/
 papers/
 *.pth
 *.bin
+
+# loose working notes at repo root (personal scratch, not part of the codebase)
+/step*.md
+/allinone.md
