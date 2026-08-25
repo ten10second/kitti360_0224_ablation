@@ -903,3 +903,151 @@ def test_dense_geometry_attach_infers_frame_count_from_source_views():
         torch.save(blob, Path(tmp) / "000000.pt")
         sample = attach_dense_geometry(CachedSample(), tmp)[0]
         assert sample["dense_depth"].shape == (16, 2, 2)
+
+
+# ---------------------------------------------------------------------------
+# route-chunk primitives and the chunk-mode experiment contract
+# ---------------------------------------------------------------------------
+
+def _straight_trajectory(n, step=1.0):
+    import numpy as np
+    return np.stack([np.arange(n) * step, np.zeros(n)], axis=1)
+
+
+def test_route_chunks_cut_by_arc_and_split_at_jumps():
+    import numpy as np
+    from world3d.unified_bev.chunks import build_route_chunks
+
+    pos = _straight_trajectory(40)
+    fids = list(range(100, 140))
+    chunks = build_route_chunks(pos, fids, chunk_arc_m=12.0, max_step_m=5.0)
+    assert [len(c.fids) for c in chunks] == [13, 13, 13, 1]
+    assert all(abs(c.arc_length - 12.0) < 1e-9 for c in chunks[:3])
+    assert chunks[0].fids[0] == 100 and chunks[1].fids[0] == 113
+
+    pos_jump = pos.copy()
+    pos_jump[20:] += np.array([500.0, 0.0])
+    jumped = build_route_chunks(pos_jump, fids, chunk_arc_m=12.0, max_step_m=5.0)
+    assert {c.segment for c in jumped} == {0, 1}
+    assert jumped[0].fids == list(range(100, 113))
+    assert jumped[2].segment == 1 and jumped[2].fids[0] == 120
+
+
+def test_chunk_hole_patterns_and_guard_band():
+    import numpy as np
+    from world3d.unified_bev.chunks import (
+        build_chunk_windows,
+        build_route_chunks,
+        core_member_index,
+        guard_keep_mask,
+        missing_chunks,
+    )
+
+    pos = _straight_trajectory(52)
+    chunks = build_route_chunks(pos, list(range(100, 152)))
+    windows = build_chunk_windows(chunks, chunks_per_window=4,
+                                  min_frames_per_chunk=6, max_window_span_m=52.0)
+    assert len(windows) == 1
+    w = windows[0]
+    # holes are contiguous interior blocks starting at chunk 1
+    assert [c.index for c in missing_chunks(w, 3)] == [1]
+    assert [c.index for c in missing_chunks(w, 2)] == [1, 2]
+    assert [c.index for c in missing_chunks(w, 1)] == [1, 2, 3]
+    # guard drops kept frames within guard of the hole interval
+    hole = (12.0, 13.0 + 12.0)
+    kept2 = guard_keep_mask(w[3], hole, 4.0)
+    arcs = w[3].member_arcs()
+    assert (kept2 == (arcs >= hole[1] + 4.0)).all()
+    # the query core frame sits deeper than the guard inside its chunk
+    for c in w:
+        i = core_member_index(c, 4.0)
+        assert min(abs(arcs[i] - c.arc_start) for arcs in [c.member_arcs()]) >= 0
+        assert min(
+            c.member_arcs()[i] - c.arc_start, c.arc_end - c.member_arcs()[i],
+        ) >= 4.0
+
+
+def test_select_chunk_frames_guard_safe_subset_of_geometry():
+    import numpy as np
+    from world3d.unified_bev.chunks import (
+        build_route_chunks,
+        missing_chunks,
+        select_chunk_frames,
+    )
+
+    pos = _straight_trajectory(52)
+    chunks = build_route_chunks(pos, list(range(100, 152)))
+    w = chunks[:4]
+    # chunk 0 guards only its right side (the first hole always starts at c1)
+    lift0, geom0 = select_chunk_frames(
+        w[0], 2, 4.0, 8, guard_left=False, guard_right_arc=w[1].arc_start)
+    assert len(lift0) == 2 and set(lift0) <= set(geom0) and len(geom0) <= 8
+    # other chunks guard only their left side
+    for c in w[1:]:
+        lift_c, geom_c = select_chunk_frames(c, 2, 4.0, 8)
+        assert len(lift_c) == 2 and set(lift_c) <= set(geom_c) and len(geom_c) <= 8
+    # the guard property holds against EVERY hole pattern
+    for K in (1, 2, 3):
+        missing = missing_chunks(w, K)
+        hole = (min(c.arc_start for c in missing), max(c.arc_end for c in missing))
+        kept = [c for c in w if c not in missing]
+        lifts = {}
+        lifts[w[0].index] = select_chunk_frames(
+            w[0], 2, 4.0, 8, guard_left=False, guard_right_arc=w[1].arc_start)[0]
+        for c in w[1:]:
+            lifts[c.index] = select_chunk_frames(c, 2, 4.0, 8)[0]
+        for c in kept:
+            for m in lifts[c.index]:
+                arc = c.member_arcs()[m]
+                dist = max(hole[0] - arc, arc - hole[1], 0.0)
+                assert dist >= 4.0 - 1e-6, (K, c.index, dist)
+
+
+def test_chunk_identity_is_idempotent():
+    from world3d.unified_bev.data import (
+        geometry_sample_identity,
+        validate_geometry_blob_identity,
+    )
+
+    meta = {
+        "drive": "d", "target_fid": 7,
+        "chunk_table": [{
+            "index": 0, "fids": [1, 2, 3], "geometry_fids": [1, 3],
+            "lift_fids": [1, 3], "arc_start": 0.0, "arc_end": 2.0, "core_fid": 2,
+        }],
+        "query_fids": [2], "guard_m": 4.0, "frames_per_chunk": 2,
+        "chunking_version": "route_chunk_v1",
+        "view_layout_version": "front2_left3_right3_v1",
+    }
+    identity = geometry_sample_identity(meta)
+    assert identity["geometry_fids"] == [[1, 3]]
+    validate_geometry_blob_identity({"sample_identity": identity}, meta)
+    other = dict(meta, target_fid=8)
+    try:
+        validate_geometry_blob_identity({"sample_identity": identity}, other)
+        raise AssertionError("identity mismatch must fail")
+    except RuntimeError:
+        pass
+
+
+def test_completion_alpha_schedule_over_chunk_counts():
+    import torch
+    from world3d.unified_bev.models import LatentCompletion
+
+    torch.manual_seed(0)
+    n_chunks = 4
+    completion = LatentCompletion(mode="residual", channels=8,
+                                  bev_height=16, bev_width=16, tile_size_m=48.0)
+    z_gnd = torch.randn(1, 8, 16, 16)
+    z_sat = torch.randn(1, 8, 16, 16)
+    coverage = torch.zeros(1, 1, 16, 16)
+    # K = Nc is the dense identity, bit-for-bit
+    out = completion(z_sat, z_gnd, coverage, n_chunks, n_chunks)
+    assert out.latent is z_gnd
+    assert float(out.correction.abs().sum()) == 0.0
+    # fewer kept chunks leave progressively more room for the correction
+    magnitudes = []
+    for k in (1, 2, 3):
+        out = completion(z_sat, z_gnd, coverage, k, n_chunks)
+        magnitudes.append(float(out.correction.abs().mean()))
+    assert magnitudes[0] >= magnitudes[1] >= magnitudes[2]

@@ -723,3 +723,50 @@ class ColumnFieldDecoder(nn.Module):
         sigma, rgb = self._query(z, pts, dirs, origin_xy, tile_size_m)
         rgb_out, _, opacity = render_volume(sigma.squeeze(-1), rgb, dist)
         return rgb_out.permute(0, 3, 1, 2), opacity
+
+
+def render_multi_view(
+    decoder: ColumnFieldDecoder,
+    z: torch.Tensor,
+    K: torch.Tensor,
+    T_world_cam: torch.Tensor,
+    origin_xy: torch.Tensor,
+    *,
+    tile_size_m: float,
+    image_size: Tuple[int, int],
+    near_m: float = 1.0,
+    far_m: float = 60.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Render one latent from N query cameras per batch item.
+
+    ``K``/``T_world_cam`` are ``(B, Nq, 3, 3)``/``(B, Nq, 4, 4)`` (a single
+    query may be passed as ``(B, 3, 3)`` and is unsqueezed).  Returns RGB
+    ``(B, Nq, 3, H, W)``, camera-z depth and opacity ``(B, Nq, H, W)``.
+    """
+    if K.ndim == 3:
+        K = K.unsqueeze(1)
+    if T_world_cam.ndim == 3:
+        T_world_cam = T_world_cam.unsqueeze(1)
+    if K.ndim != 4 or K.shape[:2] != T_world_cam.shape[:2]:
+        raise ValueError(
+            f"K {tuple(K.shape)} and T {tuple(T_world_cam.shape)} must be (B,Nq,...)"
+        )
+    B, Nq = K.shape[:2]
+    C, Hb, Wb = z.shape[1], z.shape[2], z.shape[3]
+    z_rep = z.unsqueeze(1).expand(B, Nq, C, Hb, Wb).reshape(B * Nq, C, Hb, Wb)
+    rgb, depth, opacity = decoder.render(
+        z_rep,
+        K.reshape(B * Nq, 3, 3),
+        T_world_cam.reshape(B * Nq, 4, 4),
+        origin_xy.repeat_interleave(Nq, dim=0),
+        tile_size_m=tile_size_m,
+        image_size=image_size,
+        near_m=near_m,
+        far_m=far_m,
+    )
+    W_img, H_img = image_size
+    return (
+        rgb.view(B, Nq, 3, H_img, W_img),
+        depth.view(B, Nq, H_img, W_img),
+        opacity.view(B, Nq, H_img, W_img),
+    )

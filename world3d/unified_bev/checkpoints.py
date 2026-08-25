@@ -32,6 +32,7 @@ def compute_stage_a_fingerprint(checkpoint: Mapping[str, object]) -> str:
         for key in (
             "schema_version", "ground_config", "renderer_config",
             "geometry_decoder_config", "geometry_target_version", "grid_config",
+            "chunk_config",
         )
         if key in checkpoint
     }
@@ -104,6 +105,26 @@ def validate_stage_a_dataset(
             "Stage-A target view layout mismatch: "
             f"checkpoint={expected_target_layout!r}, dataset={actual_target_layout!r}"
         )
+    chunk_config = checkpoint.get("chunk_config")
+    dataset_chunking = getattr(dataset, "chunking_version", None)
+    if (chunk_config is not None) != (dataset_chunking is not None):
+        raise RuntimeError(
+            f"Stage-A chunking mismatch: checkpoint chunked={chunk_config is not None}, "
+            f"dataset chunked={dataset_chunking is not None}"
+        )
+    if chunk_config is not None:
+        for key, attr in (
+            ("chunks_per_window", "chunks_per_window"),
+            ("frames_per_chunk", "frames_per_chunk"),
+            ("guard_m", "guard_m"),
+            ("chunk_arc_m", "chunk_arc_m"),
+        ):
+            actual = getattr(dataset, attr, None)
+            if actual is None or abs(float(chunk_config[key]) - float(actual)) > 1e-6:
+                raise RuntimeError(
+                    f"Stage-A chunk mismatch for {key}: "
+                    f"checkpoint={chunk_config[key]!r}, dataset={actual!r}"
+                )
 
 
 def validate_stage_b_checkpoint(

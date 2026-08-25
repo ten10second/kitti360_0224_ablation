@@ -163,3 +163,19 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 - **发现问题**：VGGT source 已改为双 crop，但 Stage-A/B 的 `target_rgb` 仍沿用旧 `_view()`，把 1408×376 整图直接压成 160×96；因此此前可视化中的“原始 RGB”已经发生横向几何扭曲，训练目标也不成立。
 - **修复**：target 改为与 cam0 source 一致的两个 calibrated front crops，分别保留 crop-specific `K`，renderer、target support、RGB losses、depth metrics、SSIM/LPIPS 全部支持 `(B,2,...)`；删除旧整图 target 路径，Stage-A/B schema 升至 v3，sample cache 增加 target-layout gate。
 - **验证**：45/45 回归测试通过；真实 tile 得到 `target_rgb=(2,3,96,160)`；Stage-A/Stage-B/evaluator 双-target smoke 通过。单 tile Stage-A 5k QA：dense RGB PSNR 16.766 dB、LiDAR depth AbsRel 0.073、RMSE 2.883 m、VGGT lift coverage 0.421。
+
+### 2026-08-25 — 实验单位重构：frame → route chunk（spatial hole completion）
+
+- **动机**：用户裁定主实验单位不应是帧而应是"a geometry-bearing ground observation chunk"。连续帧高度重复使 Ns 逐帧稀疏混淆了两种问题：encoder 少视图退化（诊断）与车辆未采集该空间（主张）。主张升级为 *overhead-conditioned recovery of missing ground-chunk geometry states under sparse trajectory coverage*，指标从"几帧"改为 ground-equivalent acquisition length（米）。
+- **chunks.py**：`build_route_chunks`（12 m 弧长切分、>5 m 跳变切段）、窗口（4 chunk ≤48 m）、hole=中间连续块（missing_chunks，K∈{1,2,3}）、guard 单侧化（chunk0 护右侧、其余护左侧——hole 永远是内部块，外侧不必 guard；两侧 guard 会吃掉 12 m 中的 8 m 导致快行路段无帧可用）、lift 帧（guard 安全带内均匀取）与 geometry 帧（lift∪上下文，≤8 帧封顶 VGGT 视图预算）。
+- **ChunkedUnifiedBEVDataset**：复用全部视图构建；source=每 chunk 2 个 lift 帧（4×2×8 视图=64，与 v6 预算一致）；query=各 chunk 弧中点帧（front2）；meta 带 chunk 表。0003 真实数据 22 窗口。
+- **cache v7**：每 chunk 一次独立联合 forward（64 视图/次，成本与 v6 单 subset 相同）；chunk 级 exactness（条件间只在 chunk 成员上不同，K-chunk 条件拼装条目零额外推理）；identity 按窗口 chunk 表；主链不再出现 camera-rig fallback。实测 1 tile：4 chunk 全 vehicle_motion 多 baseline，MAD 0.028–0.112，18 s/tile。
+- **Stage A/B/eval/C2/主链**：A 多 query 渲染（render_multi_view，同时修复旧多视图 target 的潜在广播问题）；B 的 sparse_source_choices 变为保留 chunk 数 K、alpha=1−K/Nc、K=Nc 逐位恒等；新 evaluator `eval_unified_bev_chunk_probe.py`（hole/hole_core 分区= kept support 腐蚀 guard、per-query-chunk 指标、逐 chunk scale QA）；新 C2 `consistency_unified_bev_chunk.py`（{c0,c2} vs {c1,c3}）；`l_equiv_analysis.py` 输出 L_equiv；主链 `run_unified_bev_chunk_chain.sh`。schema 升 3，fingerprint 纳入 chunk_config。
+- **验证**：50/50 单测（新增 5 项：弧长切分/跳变、hole 模式与 guard、lift⊆geometry∧全 K guard、identity 幂等、chunk 计数 alpha 表）；1-tile 真实 GPU smoke 全链通过（cache→A→B→eval→C2→L_equiv）。
+- **已知事实**：K=2 时 M_hole≈6.5%、hole_core≈3.4%——kept chunk 相机的远距可见性仍覆盖多数 BEV，hole 大小由 conf 门控与 K 共同决定，属实验结果而非缺陷；完整 20k/10k 训练未启动。
+
+## 运行说明（chunk 链）
+
+```bash
+WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_chunk_chain.sh
+```

@@ -114,6 +114,15 @@ def main():
     ap.add_argument("--cache", default=None, help="prebuilt sample cache; serving from RAM, workers forced to 0")
     ap.add_argument("--geometry_cache", "--m3d_cache", dest="geometry_cache", default=None,
                     help="dense geometry cache; Stage A must use the same geometry family")
+    ap.add_argument("--chunked", action="store_true",
+                    help="route-chunk mode (cache v7): sparse_source_choices become kept-chunk "
+                         "counts K in [1, N_c-1]; the hole is the middle N_c-K chunks")
+    ap.add_argument("--chunks_per_window", type=int, default=4)
+    ap.add_argument("--chunk_arc_m", type=float, default=12.0)
+    ap.add_argument("--guard_m", type=float, default=4.0)
+    ap.add_argument("--frames_per_chunk", type=int, default=2)
+    ap.add_argument("--max_geometry_frames", type=int, default=8)
+    ap.add_argument("--window_stride", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
@@ -128,10 +137,25 @@ def main():
         raise ValueError(
             "ground_only has no Stage-B parameters; evaluate sparse Stage A directly without --stage_b"
         )
+    if args.chunked and not args.geometry_cache:
+        raise ValueError("--chunked requires --geometry_cache (chunk cache v7)")
+    if args.chunked and args.cache:
+        raise ValueError("--chunked currently requires the raw dataset path")
     if args.cache and args.geometry_cache:
         ds = load_dense_cached_unified_bev(args.cache, args.geometry_cache)
     elif args.cache:
         ds = load_cached_unified_bev(args.cache)
+    elif args.chunked:
+        from world3d.unified_bev.data import ChunkedUnifiedBEVDataset, attach_chunk_geometry
+        ds = attach_chunk_geometry(ChunkedUnifiedBEVDataset(
+            args.manifest, lidar_root=args.lidar_root, drive=args.drive,
+            chunks_per_window=args.chunks_per_window, chunk_arc_m=args.chunk_arc_m,
+            guard_m=args.guard_m, frames_per_chunk=args.frames_per_chunk,
+            max_geometry_frames=args.max_geometry_frames,
+            window_stride=args.window_stride, max_samples=args.max_samples,
+            image_size=(args.image_width, args.image_height),
+            max_points_per_view=args.max_points,
+        ), args.geometry_cache)
     else:
         ds = UnifiedBEVDataset(
             args.manifest, lidar_root=args.lidar_root, dense_source_count=args.dense_sources,
@@ -146,6 +170,11 @@ def main():
     validate_stage_a_dataset(
         ckpt, ds, dense_geometry_attached=bool(args.geometry_cache),
     )
+    if args.chunked:
+        # choices are kept-chunk counts K; N_c replaces the frame count
+        source_choices = parse_source_choices(
+            args.sparse_source_choices, args.chunks_per_window - 1, ds.chunks_per_window,
+        )
     loader = DataLoader(
         ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
         drop_last=True, persistent_workers=args.num_workers > 0,
@@ -197,8 +226,43 @@ def main():
     if any(id(parameter) in frozen_ids for group in opt.param_groups for parameter in group["params"]):
         raise RuntimeError("Stage-B optimizer contains a frozen Stage-A parameter")
     print(f"[stage-b] device={device} samples={len(ds)} fusion={args.fusion} "
-          f"Ns={source_choices} decoder=frozen mpp=0.196 "
+          f"{'K(chunks)' if args.chunked else 'Ns'}={source_choices} decoder=frozen mpp=0.196 "
           f"trainable_params={sum(p.numel() for p in trainable)}")
+
+    n_chunks = ds.chunks_per_window if args.chunked else None
+
+    def _kept_positions(kept_count: int) -> List[int]:
+        """Kept chunk positions: head chunk plus the trailing kept block."""
+        return [0] + list(range(n_chunks - kept_count + 1, n_chunks))
+
+    def _chunk_lift(rgb, positions: List[int]):
+        fpc, vpf = ds.frames_per_chunk, ds.views_per_frame
+        rows = torch.tensor(
+            [r for p in positions for r in range(p * fpc * vpf, (p + 1) * fpc * vpf)],
+            device=device,
+        )
+        depth = torch.cat([batch[f"dense_depth_c{p}"] for p in positions], dim=1)
+        conf = torch.cat([batch[f"dense_conf_c{p}"] for p in positions], dim=1)
+        return ground(
+            rgb[:, rows], batch["source_K"][:, rows], depth, conf,
+            batch["source_T_world_cam"][:, rows],
+            batch["origin_xy"], ds.bev_resolution_m,
+        )
+
+    def _flatten_queries(batch):
+        """(B, Nq, ...) query tensors -> (B*Nq, ...) so the loop below is
+        identical to the single-query legacy path."""
+        nq = batch["target_rgb"].shape[1]
+        flat = {
+            "target_rgb": batch["target_rgb"].flatten(0, 1),
+            "target_K": batch["target_K"].flatten(0, 1),
+            "target_T_world_cam": batch["target_T_world_cam"].flatten(0, 1),
+            "target_depth": batch["target_depth"].flatten(0, 1),
+            "target_depth_mask": batch["target_depth_mask"].flatten(0, 1),
+            "origin_xy": batch["origin_xy"].repeat_interleave(nq, dim=0),
+        }
+        batch.update(flat)
+        return batch
 
     iterator = iter(loader)
     running = 0.0
@@ -209,6 +273,8 @@ def main():
         except StopIteration:
             iterator = iter(loader); batch = next(iterator)
         batch = move_batch(batch, device)
+        if args.chunked:
+            batch = _flatten_queries(batch)
         n_sparse = rng.choice(source_choices)
         with torch.no_grad():
             def _lift(rgb, start_frame, frame_count):
@@ -228,8 +294,14 @@ def main():
                     batch["source_points_uv"][:, sl], batch["source_points_valid"][:, sl],
                     batch["origin_xy"], ds.bev_resolution_m,
                 )
-            z_star, ref_mask = _lift(batch["source_rgb"], 0, args.dense_sources)
-            z_sparse, sparse_mask = _lift(batch["source_rgb"], 0, n_sparse)
+            if args.chunked:
+                z_star, ref_mask = _chunk_lift(batch["source_rgb"], list(range(n_chunks)))
+                z_sparse, sparse_mask = _chunk_lift(
+                    batch["source_rgb"], _kept_positions(int(n_sparse)),
+                )
+            else:
+                z_star, ref_mask = _lift(batch["source_rgb"], 0, args.dense_sources)
+                z_sparse, sparse_mask = _lift(batch["source_rgb"], 0, n_sparse)
         with torch.no_grad():
             h_ref, h_valid, _ = relative_height_map(
                 batch["source_points_world"], batch["source_points_valid"],
@@ -255,19 +327,28 @@ def main():
                 if uses_satellite else torch.zeros_like(z_sparse)
             )
         completion_output = completion(
-            z_sat, z_sparse, sparse_mask, n_sparse, args.dense_sources,
+            z_sat, z_sparse, sparse_mask, n_sparse,
+            n_chunks if args.chunked else args.dense_sources,
         )
         z_hat = completion_output.latent
+        z_render = (
+            z_hat.repeat_interleave(batch["target_K"].shape[0] // z_hat.shape[0], dim=0)
+            if batch["target_K"].shape[0] != z_hat.shape[0] else z_hat
+        )
         pred_rgb, pred_depth, _ = decoder.render(
-            z_hat, batch["target_K"], batch["target_T_world_cam"], batch["origin_xy"],
+            z_render, batch["target_K"], batch["target_T_world_cam"], batch["origin_xy"],
             tile_size_m=ds.tile_size_m, image_size=ds.image_size,
         )
         geometry_pred = geometry_decoder(z_hat)
         with torch.no_grad():
             # Dense-ground Z* supplies a dense target-view geometry teacher.
             # Sparse target LiDAR overwrites it wherever metric truth exists.
+            z_star_render = (
+                z_star.repeat_interleave(batch["target_K"].shape[0] // z_star.shape[0], dim=0)
+                if batch["target_K"].shape[0] != z_star.shape[0] else z_star
+            )
             _, teacher_depth, _ = decoder.render(
-                z_star, batch["target_K"], batch["target_T_world_cam"],
+                z_star_render, batch["target_K"], batch["target_T_world_cam"],
                 batch["origin_xy"], tile_size_m=ds.tile_size_m,
                 image_size=ds.image_size,
             )
@@ -275,10 +356,14 @@ def main():
                 batch["target_depth_mask"], batch["target_depth"], teacher_depth,
             )
             teacher_depth_valid = torch.isfinite(teacher_depth) & (teacher_depth > 1e-3)
+        sparse_support_queries = (
+            sparse_mask.repeat_interleave(batch["target_K"].shape[0] // sparse_mask.shape[0], dim=0)
+            if batch["target_K"].shape[0] != sparse_mask.shape[0] else sparse_mask
+        )
         target_supported_pixels = target_pixels_supported_by_bev(
             teacher_depth, teacher_depth_valid,
             batch["target_K"], batch["target_T_world_cam"], batch["origin_xy"],
-            ds.tile_size_m, sparse_mask,
+            ds.tile_size_m, sparse_support_queries,
         )
 
         anchor_loss = masked_smooth_l1(z_hat, z_sparse, observed_cells)

@@ -18,6 +18,13 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
+from .chunks import (
+    RouteChunk,
+    build_chunk_windows,
+    build_route_chunks,
+    core_member_index,
+    select_chunk_frames,
+)
 from .fisheye import FisheyeVirtualRig
 from .geometry import project_points_to_image, se3_inverse, sparse_depth_zbuffer, transform_points
 
@@ -28,6 +35,7 @@ FRONT_CROP_OVERLAP = 72
 VIEW_LAYOUT_VERSION = "front2_left3_right3_v1"
 VIEW_CAMERA_IDS = (0, 0, 1, 1, 1, 2, 2, 2)
 TARGET_VIEW_LAYOUT_VERSION = "front2_v1"
+CHUNKING_VERSION = "route_chunk_v1"
 
 
 def centered_two_crop_starts(
@@ -416,6 +424,225 @@ class UnifiedBEVDataset(Dataset):
         }
 
 
+class ChunkedUnifiedBEVDataset(UnifiedBEVDataset):
+    """Ground evidence as route chunks: spatial hole completion sampling.
+
+    A sample is one window of ``N_c`` consecutive route chunks.  Source views
+    come from ``frames_per_chunk`` guard-safe lift frames per chunk (the same
+    rule for dense and any sparse condition, so conditions differ only in
+    chunk membership).  Query views are the core (arc-midpoint) frame of each
+    chunk; a condition that drops chunk ``i`` is evaluated exactly on the
+    queries of its missing chunks.  The satellite tile anchors at the window
+    center.
+    """
+
+    def __init__(
+        self,
+        manifest: str,
+        *,
+        lidar_root: str,
+        chunks_per_window: int = 4,
+        chunk_arc_m: float = 12.0,
+        max_step_m: float = 5.0,
+        min_frames_per_chunk: int = 6,
+        guard_m: float = 4.0,
+        frames_per_chunk: int = 2,
+        max_geometry_frames: int = 8,
+        max_window_span_m: float = 48.0,
+        window_stride: int = 1,
+        tile_size_m: float = 64.0,
+        bev_resolution_m: float = 0.5,
+        image_size: Tuple[int, int] = (160, 96),
+        max_points_per_view: int = 2048,
+        max_samples: Optional[int] = None,
+        drive: Optional[str] = None,
+        use_fisheye: bool = True,
+    ):
+        self.chunks_per_window = int(chunks_per_window)
+        self.chunk_arc_m = float(chunk_arc_m)
+        self.max_step_m = float(max_step_m)
+        self.min_frames_per_chunk = int(min_frames_per_chunk)
+        self.guard_m = float(guard_m)
+        self.frames_per_chunk = int(frames_per_chunk)
+        self.max_geometry_frames = int(max_geometry_frames)
+        self.max_window_span_m = float(max_window_span_m)
+        self.chunking_version = CHUNKING_VERSION
+        self.window_stride = max(1, int(window_stride))
+        if frames_per_chunk < 1:
+            raise ValueError("frames_per_chunk must be >= 1")
+        super().__init__(
+            manifest, lidar_root=lidar_root,
+            dense_source_count=chunks_per_window * frames_per_chunk,
+            sparse_source_count=frames_per_chunk,
+            tile_size_m=tile_size_m, bev_resolution_m=bev_resolution_m,
+            image_size=image_size, max_points_per_view=max_points_per_view,
+            max_samples=max_samples, drive=drive, use_fisheye=use_fisheye,
+        )
+        # each window exposes N_c query frames x two front views
+        self.target_views = self.chunks_per_window * 2
+
+    def _build_samples(self, max_samples: Optional[int]) -> list:
+        samples = []
+        half_tile = self.tile_size_m / 2.0
+        for records in self._records_by_drive.values():
+            if not records:
+                continue
+            xy = np.asarray([[r.T_world_imu[0, 3], r.T_world_imu[1, 3]] for r in records])
+            chunks = build_route_chunks(
+                xy, [r.fid for r in records],
+                chunk_arc_m=self.chunk_arc_m, max_step_m=self.max_step_m,
+            )
+            windows = build_chunk_windows(
+                chunks, chunks_per_window=self.chunks_per_window,
+                min_frames_per_chunk=self.min_frames_per_chunk,
+                max_window_span_m=self.max_window_span_m,
+            )
+            by_fid = {r.fid: r for r in records}
+            for window in windows[::self.window_stride]:
+                anchor_xy = np.stack([c.center_xy for c in window]).mean(axis=0)
+                if np.max(np.linalg.norm(np.stack([c.center_xy for c in window]) - anchor_xy, axis=1)) > half_tile:
+                    continue
+                try:
+                    selection = {}
+                    for pos, c in enumerate(window):
+                        if pos == 0:
+                            # chunk 0 only faces a hole on its right; the
+                            # first hole always starts at chunk 1's arc.
+                            selection[c.index] = select_chunk_frames(
+                                c, self.frames_per_chunk, self.guard_m,
+                                self.max_geometry_frames,
+                                guard_left=False,
+                                guard_right_arc=window[1].arc_start,
+                            )
+                        else:
+                            selection[c.index] = select_chunk_frames(
+                                c, self.frames_per_chunk, self.guard_m,
+                                self.max_geometry_frames,
+                            )
+                    lift = {c.index: selection[c.index][0] for c in window}
+                    geometry = {c.index: selection[c.index][1] for c in window}
+                    core = {c.index: core_member_index(c, self.guard_m) for c in window}
+                except ValueError:
+                    continue
+                window_fids = {f for c in window for f in c.fids}
+                anchor = min(
+                    (by_fid[f] for f in window_fids),
+                    key=lambda r: (
+                        np.hypot(r.T_world_imu[0, 3] - anchor_xy[0],
+                                 r.T_world_imu[1, 3] - anchor_xy[1]),
+                        r.fid,
+                    ),
+                )
+                samples.append((anchor, window, geometry, lift, core, by_fid))
+                if max_samples is not None and len(samples) >= max_samples:
+                    return samples
+        return samples
+
+    def chunk_table(self, idx: int) -> List[dict]:
+        _, window, geometry, lift, core, _ = self.samples[idx]
+        return [
+            {
+                "index": c.index,
+                "fids": list(c.fids),
+                "geometry_member_idx": list(geometry[c.index]),
+                "geometry_fids": [c.fids[m] for m in geometry[c.index]],
+                "lift_member_idx": list(lift[c.index]),
+                "lift_fids": [c.fids[m] for m in lift[c.index]],
+                "arc_start": c.arc_start,
+                "arc_end": c.arc_end,
+                "core_fid": c.fids[core[c.index]],
+            }
+            for c in window
+        ]
+
+    def window_records(self, idx: int) -> List[List[FrameRecord]]:
+        """Per chunk: the geometry frames that enter its joint VGGT forward."""
+        _, window, geometry, _, _, by_fid = self.samples[idx]
+        return [
+            [by_fid[c.fids[m]] for m in geometry[c.index]] for c in window
+        ]
+
+    def __getitem__(self, idx: int) -> dict:
+        anchor, window, geometry, lift, core, by_fid = self.samples[idx]
+        lift_frames = [c.fids[m] for c in window for m in lift[c.index]]
+        source_items: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        for fid in lift_frames:
+            rec = by_fid[fid]
+            source_items.extend(self._front_views(rec))
+            if self.use_fisheye:
+                source_items.extend(self._virtual_views(rec))
+        expected = len(lift_frames) * self.views_per_frame
+        if len(source_items) != expected:
+            raise RuntimeError(
+                f"incomplete source rig: expected {expected} views, got {len(source_items)}"
+            )
+        max_p = max(x[3].shape[0] for x in source_items)
+        n = len(source_items)
+        source_images = torch.stack([x[0] for x in source_items])
+        source_K = torch.stack([x[1] for x in source_items])
+        source_T = torch.stack([x[2] for x in source_items])
+        points_world = torch.zeros((n, max_p, 3), dtype=torch.float32)
+        points_uv = torch.zeros((n, max_p, 2), dtype=torch.float32)
+        points_valid = torch.zeros((n, max_p), dtype=torch.bool)
+        for j, item in enumerate(source_items):
+            p = item[3]
+            points_world[j, : p.shape[0]] = p[:, :3]
+            points_uv[j, : p.shape[0]] = p[:, 3:5]
+            points_valid[j, : p.shape[0]] = p[:, 5] > 0.5
+
+        query_items = []
+        for c in window:
+            query_items.extend(self._front_views(by_fid[c.fids[core[c.index]]]))
+        query_rgb = torch.stack([x[0] for x in query_items])
+        query_K = torch.stack([x[1] for x in query_items])
+        query_T = torch.stack([x[2] for x in query_items])
+        depth_items = [
+            sparse_depth_zbuffer(x[3][:, :3], x[2], x[1], self.image_size)
+            for x in query_items
+        ]
+        query_depth = torch.stack([d for d, _ in depth_items])
+        query_depth_mask = torch.stack([m for _, m in depth_items])
+
+        with _open_image(anchor.sat_path) as im:
+            sat = torch.from_numpy(np.asarray(im.convert("RGB"), dtype=np.float32)).permute(2, 0, 1) / 255.0
+        origin_xy = torch.tensor(
+            [anchor.T_world_imu[0, 3] - self.tile_size_m / 2,
+             anchor.T_world_imu[1, 3] - self.tile_size_m / 2], dtype=torch.float32
+        )
+        return {
+            "target_rgb": query_rgb,          # front2 views of the per-chunk query frames
+            "target_K": query_K,
+            "target_T_world_cam": query_T,
+            "target_depth": query_depth,
+            "target_depth_mask": query_depth_mask,
+            "source_rgb": source_images,
+            "source_K": source_K,
+            "source_T_world_cam": source_T,
+            "source_T_world_imu": torch.stack([
+                torch.from_numpy(by_fid[f].T_world_imu.astype(np.float32)) for f in lift_frames
+            ]),
+            "source_points_world": points_world,
+            "source_points_uv": points_uv,
+            "source_points_valid": points_valid,
+            "satellite": sat,
+            "origin_xy": origin_xy,
+            "meta": {
+                "drive": anchor.drive,
+                "target_fid": anchor.fid,
+                "source_fids": lift_frames,
+                "chunk_table": self.chunk_table(idx),
+                "query_fids": [c.fids[core[c.index]] for c in window],
+                "chunks_per_window": self.chunks_per_window,
+                "frames_per_chunk": self.frames_per_chunk,
+                "guard_m": self.guard_m,
+                "chunking_version": CHUNKING_VERSION,
+                "views_per_frame": self.views_per_frame,
+                "view_layout_version": self.view_layout_version,
+                "target_view_layout_version": self.target_view_layout_version,
+            },
+        }
+
+
 _CACHE_IMAGE_KEYS = ("target_rgb", "source_rgb", "satellite")
 
 
@@ -494,6 +721,33 @@ def dense_geometry_subset_key(start_frame: int, frame_count: int) -> str:
 
 def geometry_sample_identity(meta: Mapping[str, object]) -> Dict[str, object]:
     """Canonical cache identity for one target tile and its source frames."""
+    if meta.get("chunk_table") is not None:
+        chunk_table = meta["chunk_table"]
+        return {
+            "drive": str(meta["drive"]),
+            "anchor_fid": int(meta["target_fid"]),
+            "chunking_version": str(meta.get("chunking_version", "legacy_chunk")),
+            "guard_m": float(meta.get("guard_m", -1.0)),
+            "frames_per_chunk": int(meta.get("frames_per_chunk", -1)),
+            "geometry_fids": [[int(f) for f in c["geometry_fids"]] for c in chunk_table],
+            "chunks": [[int(f) for f in c["fids"]] for c in chunk_table],
+            "query_fids": [int(f) for f in meta.get("query_fids", [])],
+            "view_layout_version": str(meta.get("view_layout_version", "legacy_unknown")),
+        }
+    if meta.get("geometry_fids") is not None:  # already an identity dict
+        return geometry_sample_identity({
+            "drive": meta["drive"],
+            "target_fid": meta["anchor_fid"],
+            "chunking_version": meta["chunking_version"],
+            "guard_m": meta["guard_m"],
+            "frames_per_chunk": meta["frames_per_chunk"],
+            "chunk_table": [
+                {"geometry_fids": g, "fids": c}
+                for g, c in zip(meta["geometry_fids"], meta["chunks"])
+            ],
+            "query_fids": meta["query_fids"],
+            "view_layout_version": meta["view_layout_version"],
+        })
     source_fids = meta.get("source_fids")
     if torch.is_tensor(source_fids):
         source_fids = source_fids.detach().cpu().flatten().tolist()
@@ -672,6 +926,112 @@ def attach_dense_geometry(base, geometry_cache: str):
             return getattr(self.base, name)
 
     return _DensePair(base, geometry_cache)
+
+
+def chunk_subset_qa(blob: Mapping[str, object], chunk_position: int) -> Dict[str, float | int | str]:
+    """Read one chunk's VGGT scale QA without touching geometry tensors."""
+    subsets = blob.get("subsets")
+    if not isinstance(subsets, Mapping):
+        raise RuntimeError("chunk geometry cache has no subsets")
+    key = f"c{int(chunk_position)}"
+    if key not in subsets:
+        raise KeyError(f"chunk geometry cache is missing chunk {key}")
+    return _subset_entry_qa(subsets[key])
+
+
+def _subset_entry_qa(entry: Mapping[str, object]) -> Dict[str, float | int | str]:
+    source = str(entry.get("scale_source", "unknown"))
+    pair_count = int(entry.get("scale_pair_count", 0))
+
+    def scalar(name: str) -> float:
+        value = entry.get(name, float("nan"))
+        return float(value.item()) if torch.is_tensor(value) else float(value)
+
+    return {
+        "metric_scale": scalar("metric_scale"),
+        "scale_source": source,
+        "scale_reliability": str(entry.get(
+            "scale_reliability", geometry_scale_reliability(source, pair_count),
+        )),
+        "scale_pair_count": pair_count,
+        "scale_relative_mad": scalar("scale_relative_mad"),
+        "pose_alignment_rmse_m": scalar("pose_alignment_rmse_m"),
+    }
+
+
+def chunk_lift_geometry(
+    blob: Mapping[str, object],
+    meta: Mapping[str, object],
+    chunk_position: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Depth/conf rows of one chunk's lift frames from a chunk cache entry.
+
+    The entry stores the joint forward over the chunk's geometry frames;
+    lift rows are selected by their position in the geometry frame list, so
+    every condition consumes exactly the frames the dataset selected.
+    """
+    subsets = blob.get("subsets")
+    if not isinstance(subsets, Mapping):
+        raise RuntimeError("chunk geometry cache has no subsets")
+    key = f"c{int(chunk_position)}"
+    if key not in subsets:
+        raise KeyError(f"chunk geometry cache is missing chunk {key}")
+    table = meta["chunk_table"][int(chunk_position)]
+    geom_fids = list(table["geometry_fids"])
+    rows = [geom_fids.index(int(f)) for f in table["lift_fids"]]
+    entry = subsets[key]
+    depth = entry["depth"].float()
+    conf = entry["conf"].float()
+    vpf = int(meta.get("views_per_frame", 8))
+    view_rows = [r * vpf + v for r in rows for v in range(vpf)]
+    return depth[view_rows], conf[view_rows]
+
+
+def attach_chunk_geometry(base, geometry_cache: str):
+    """Join a ChunkedUnifiedBEVDataset (or its cache) with chunk cache v7.
+
+    Items additionally carry the lift-view geometry of each chunk
+    (``dense_depth_c{p}`` / ``dense_conf_c{p}``, ordered c0..cN-1) and the
+    concatenated full lift-view set (``dense_depth`` / ``dense_conf``)
+    aligned with ``source_rgb``.  Per-chunk scale QA rides along in
+    ``chunk_scale_qa``.
+    """
+    import os
+    from torch.utils.data import Dataset as _Dataset
+
+    class _ChunkPair(_Dataset):
+        def __init__(self, base, geometry_dir):
+            self.base = base
+            self.geometry_dir = geometry_dir
+
+        def __len__(self):
+            return len(self.base)
+
+        def __getitem__(self, idx):
+            s = self.base[idx]
+            blob = torch.load(os.path.join(self.geometry_dir, f"{idx:06d}.pt"),
+                              map_location="cpu", weights_only=False)
+            validate_geometry_blob_identity(
+                blob, s["meta"], context=f"chunk geometry cache index {idx}",
+            )
+            table = s["meta"]["chunk_table"]
+            parts = [chunk_lift_geometry(blob, s["meta"], p) for p in range(len(table))]
+            s["dense_depth"] = torch.cat([d for d, _ in parts])
+            s["dense_conf"] = torch.cat([c for _, c in parts])
+            for p, (d, c) in enumerate(parts):
+                s[f"dense_depth_c{p}"] = d
+                s[f"dense_conf_c{p}"] = c
+            s["dense_joint_geometry"] = True
+            s["chunk_scale_qa"] = {
+                f"c{p}": _subset_entry_qa(blob["subsets"][f"c{p}"])
+                for p in range(len(table))
+            }
+            return s
+
+        def __getattr__(self, name):
+            return getattr(self.base, name)
+
+    return _ChunkPair(base, geometry_cache)
 
 
 def load_dense_cached_unified_bev(sample_cache: str, geometry_cache: str):

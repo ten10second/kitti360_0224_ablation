@@ -18,6 +18,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -27,6 +28,7 @@ sys.path.insert(0, "/media/shizhm/Lenovo/vggt")
 from vggt.models.vggt import VGGT
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from world3d.unified_bev.data import (
+    ChunkedUnifiedBEVDataset,
     UnifiedBEVDataset,
     VIEW_LAYOUT_VERSION,
     geometry_sample_identity,
@@ -289,6 +291,15 @@ def main():
     ap.add_argument("--dense_sources", type=int, default=8)
     ap.add_argument("--subset_specs", default="0:1,0:2,0:4,0:8",
                     help="independent joint inferences as start_frame:frame_count")
+    ap.add_argument("--chunked", action="store_true",
+                    help="chunk mode: one independent joint forward per route chunk "
+                         "(cache v7); subset_specs then names chunk positions, e.g. 0,1,2,3")
+    ap.add_argument("--chunks_per_window", type=int, default=4)
+    ap.add_argument("--chunk_arc_m", type=float, default=12.0)
+    ap.add_argument("--guard_m", type=float, default=4.0)
+    ap.add_argument("--frames_per_chunk", type=int, default=2)
+    ap.add_argument("--max_geometry_frames", type=int, default=8)
+    ap.add_argument("--window_stride", type=int, default=1)
     ap.add_argument("--resolution", type=int, default=518, help="VGGT input width")
     ap.add_argument("--min_baseline_m", type=float, default=0.25)
     ap.add_argument("--max_samples", type=int, default=None)
@@ -315,7 +326,22 @@ def main():
     del state
     model.eval()
 
-    if args.raw_dataset:
+    if args.raw_dataset and args.chunked:
+        ds = ChunkedUnifiedBEVDataset(
+            args.manifest,
+            lidar_root=args.lidar_root,
+            drive=None if args.drive in (None, "none") else args.drive,
+            chunks_per_window=args.chunks_per_window,
+            chunk_arc_m=args.chunk_arc_m,
+            guard_m=args.guard_m,
+            frames_per_chunk=args.frames_per_chunk,
+            max_geometry_frames=args.max_geometry_frames,
+            window_stride=args.window_stride,
+            max_samples=args.max_samples,
+            image_size=(160, 96),
+            max_points_per_view=4096,
+        )
+    elif args.raw_dataset:
         ds = UnifiedBEVDataset(
             args.manifest,
             lidar_root=args.lidar_root,
@@ -329,6 +355,105 @@ def main():
         )
     else:
         ds = load_cached_unified_bev(args.cache)
+    if args.chunked:
+        build_chunk_cache(model, ds, args, device, out_dir)
+        return
+    run_frame_cache(model, ds, args, device, out_dir)
+
+
+def chunk_forward_views(ds, records):
+    """Stack all rig views (front2 + fisheye virtuals) of geometry frames."""
+    items = []
+    for rec in records:
+        items.extend(ds._front_views(rec))
+        if ds.use_fisheye:
+            items.extend(ds._virtual_views(rec))
+    expected = len(records) * ds.views_per_frame
+    if len(items) != expected:
+        raise RuntimeError(f"incomplete chunk rig: expected {expected} views, got {len(items)}")
+    rgb = torch.stack([x[0] for x in items])
+    K = torch.stack([x[1] for x in items])
+    T = torch.stack([x[2] for x in items])
+    imu = torch.stack([
+        torch.from_numpy(r.T_world_imu.astype(np.float32)) for r in records
+    ])
+    return rgb, K, T, imu
+
+
+def build_chunk_cache(model, ds, args, device, out_dir):
+    """Cache v7: one independent joint VGGT forward per route chunk.
+
+    Chunk-level exactness: conditions of a window differ only in chunk
+    membership; every chunk entry is inferred from exactly that chunk's
+    geometry frames, and K-chunk conditions assemble lift rows from the
+    entries without any additional inference.
+    """
+    import time as _time
+
+    chunk_positions = [int(x) for x in args.subset_specs.split(",") if x.strip()]
+    n_chunks = ds.chunks_per_window
+    if chunk_positions and max(chunk_positions) >= n_chunks:
+        raise ValueError(f"chunk positions {chunk_positions} exceed {n_chunks - 1}")
+    stop = len(ds) if args.max_samples is None else min(len(ds), args.start + args.max_samples)
+    t0 = _time.time()
+    completed = 0
+    for i in range(args.start, stop):
+        dst = out_dir / f"{i:06d}.pt"
+        sample = ds[i]
+        sample_identity = geometry_sample_identity(sample["meta"])
+        blob = None
+        if dst.exists():
+            blob = torch.load(dst, map_location="cpu", weights_only=False)
+            if blob.get("geometry_model") != "vggt" or int(blob.get("geometry_version", -1)) != 7:
+                raise RuntimeError(f"cannot augment non-chunk-v7 cache {dst}")
+            if blob.get("view_layout_version") != VIEW_LAYOUT_VERSION:
+                raise RuntimeError(f"view-layout mismatch in {dst}")
+            validate_geometry_blob_identity(blob, sample["meta"], context=str(dst))
+        subsets = dict(blob.get("subsets", {})) if blob is not None else {}
+        missing = [p for p in chunk_positions if f"c{p}" not in subsets]
+        if not missing:
+            continue
+        window_records = ds.window_records(i)
+        for p in missing:
+            rgb, K, T, imu = chunk_forward_views(ds, window_records[p])
+            entry = run_joint_subset(
+                model, rgb, T, args.resolution, args.min_baseline_m,
+                ds.views_per_frame, device,
+                gt_world_vehicle=imu,
+                view_camera_ids=torch.tensor(ds.view_camera_ids),
+            )
+            subsets[f"c{p}"] = entry
+            print(
+                f"[vggt-chunk] tile={i} chunk=c{p} frames={len(window_records[p])} "
+                f"scale={float(entry['metric_scale']):.4f} "
+                f"source={entry['scale_source']} "
+                f"reliability={entry['scale_reliability']} "
+                f"mad={float(entry['scale_relative_mad']):.3f} "
+                f"pose_rmse={float(entry['pose_alignment_rmse_m']):.3f}m",
+                flush=True,
+            )
+        updated = {
+            "geometry_model": "vggt",
+            "geometry_version": 7,
+            "sample_identity": sample_identity,
+            "scale_policy": "per_chunk_vehicle_motion",
+            "confidence_normalization": "per_view_log_expp1_q10_q90",
+            "views_per_frame": ds.views_per_frame,
+            "view_layout_version": VIEW_LAYOUT_VERSION,
+            "chunking_version": sample["meta"]["chunking_version"],
+            "subsets": subsets,
+        }
+        temporary = dst.with_suffix(".pt.tmp")
+        torch.save(updated, temporary)
+        temporary.replace(dst)
+        completed += 1
+        elapsed = _time.time() - t0
+        print(f"[vggt-chunk] {i + 1}/{stop} rate={completed / elapsed * 3600:.0f}/h", flush=True)
+    print(f"[vggt-chunk] DONE {completed} tiles in {(_time.time() - t0) / 60:.1f} min")
+
+
+def run_frame_cache(model, ds, args, device, out_dir):
+    """Legacy frame-interval cache mode (v6)."""
     total_frames = ds.dense_source_count
     specs = parse_subset_specs(args.subset_specs, total_frames)
     stop = len(ds) if args.max_samples is None else min(len(ds), args.start + args.max_samples)
