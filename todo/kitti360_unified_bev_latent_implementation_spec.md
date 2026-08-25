@@ -242,6 +242,11 @@ p_t=(x_t,y_t,\mathrm{yaw}_t)
 
 ## 3.2 鱼眼转虚拟透视相机
 
+`image_00` 的 rectified 图像约为 1408×376，不能在送入 VGGT 前直接压缩为
+160×96。默认沿 calibrated optical axis 使用两个 560 px 宽、72 px overlap
+的水平 crop；两个 crop 共享 `image_00` 的物理光心与外参，但分别使用
+`c_x' = c_x - x_0` 后再按输出尺寸缩放的内参。
+
 不要把 180° 鱼眼一次性展开成单张超宽 pinhole 图。每个鱼眼生成多个 tangent perspective crops。
 
 建议默认：
@@ -252,6 +257,14 @@ p_t=(x_t,y_t,\mathrm{yaw}_t)
 - 输出统一分辨率，例如 384 × 640；
 - 保存 valid mask；
 - crop 配置必须可修改。
+
+默认 source layout 为 `front2 + left3 + right3 = 8 views/frame`。用于 VGGT
+多帧 metric scale 的真实基线必须来自 `T_world_rig`/车辆 pose；virtual crop
+数量不得改变 metric anchor 的权重。
+
+主前视 target 同样使用这两个 calibrated crops，分别携带 crop-specific `K`，
+由同一 latent/renderer 同时查询。禁止把 1408×376 整图直接压缩到 160×96
+作为 RGB/depth 监督；该操作会把 3.74:1 横向视场扭曲为 1.67:1。
 
 对于虚拟相机 `v`：
 
@@ -405,7 +418,7 @@ BEV context network -> Z_star
 \lambda_{rgb}\mathcal L_{rgb}
 +\lambda_{perc}\mathcal L_{LPIPS}
 +\lambda_{depth}\mathcal L_{depth}
-+\lambda_{occ}\mathcal L_{occ}
++\lambda_{height}\mathcal L_{frozen-height}
 \]
 
 初始实现至少需要：
@@ -413,7 +426,10 @@ BEV context network -> Z_star
 - static-region RGB L1/Charbonnier；
 - LPIPS；
 - LiDAR-valid pixel depth loss；
-- density/occupancy regularization。
+- 由 `Z_star` 预测 local-ground-relative height 的共享几何 readout loss。
+
+该几何 readout 是一个 BEV 卷积 coarse-to-fine decoder，不称为 DPT；它只在
+Stage A 训练一次，并与 renderer 一起冻结。所有 Stage-B 变体必须由同一组权重读取。
 
 ### Stage A 验收
 
@@ -445,11 +461,14 @@ I_{sat},\qquad
 \mathcal G_{sparse}\subset\mathcal G_{dense}
 \]
 
-建议训练时随机采样：
+建议训练时随机采样非恒等分支：
 
 \[
-N_s\in\{1,2,4,8\}
+N_s\in\{1,2,4\}
 \]
+
+`N_s=8` 时 completion 按契约逐位等于 frozen `Z_gnd`，没有 Stage-B
+梯度，因此只进入 identity 回归测试与 C1 评估，不占用训练 step。
 
 ### Satellite encoder
 
@@ -476,18 +495,20 @@ Z_{gnd}^{sparse},M_{gnd}^{sparse}
 最小推荐形式：
 
 \[
-\hat Z=Z_{sat}+M_{gnd}\odot\alpha\odot\Delta Z_{gnd}
+\hat Z=Z_{gnd}^{sparse}+\alpha(N_s)\,G_{write}\odot\Delta Z
 \]
 
 \[
-\alpha=\sigma\left(G([Z_{sat},Z_{gnd},M_{gnd}])\right)
+\alpha(N_s)=1-\frac{N_s}{N_d},\qquad
+G_{write}=\sigma\left(G([Z_{sat},Z_{gnd}^{sparse},M_{gnd}])\right)
 \]
 
 解释：
 
-- `Z_sat` 形成全局 latent prior；
-- sparse ground evidence 在其真实观测位置进行残差更新；
-- 无地面观测区域不凭空复制 ground feature；
+- `Z_gnd_sparse` 是局部真实观测锚点，satellite/XY 先验进入 `Delta Z`；
+- `G_write` 是可审计的写入 gate，不称为 uncertainty；
+- 在 `N_s=N_d` 时 `alpha=0`，必须逐位返回 ground latent；
+- observed/fill 区域由确定性 support mask 定义，不由 gate 猜测；
 - `M_gnd` 是确定性观测 mask/count，不把 uncertainty modeling 作为贡献。
 
 必须实现以下替代融合以供消融：
@@ -501,7 +522,7 @@ Z_{gnd}^{sparse},M_{gnd}^{sparse}
 
 其中 `coordinate-only`（Evidence B3）的定义必须严格固定：用 canonical
 BEV 每个 pixel-center 的公制相对坐标生成确定性的 XY/Fourier positional
-encoding，替换 `Z_sat` 后进入与 proposed 完全相同的 confidence/delta
+encoding，替换 `Z_sat` 后进入与 proposed 完全相同的 write-gate/delta
 通路。该位置编码不接收梯度，不得使用可学习的 `C×H×W` 参数表，也不含
 tile ID 或绝对 GPS。可学习的逐 cell 空间模板若作为额外诊断，必须单独命名
 为 `learned-template`，不能参与 `aligned satellite > coordinate-only` gate。
@@ -510,26 +531,25 @@ tile ID 或绝对 GPS。可学习的逐 cell 空间模板若作为额外诊断�
 
 \[
 \mathcal L_B=
-\lambda_z\mathcal L_{latent}
-+\lambda_{render}\mathcal L_{frozen-render}
-+\lambda_{geo}\mathcal L_{frozen-geo}
+\lambda_{anchor}\mathcal L_{anchor}^{obs}
++\lambda_{geo}\mathcal L_{frozen-geo}^{fill}
++\lambda_{low}\mathcal L_{RGB-lowfreq}
++\lambda_{app}\mathcal L_{appearance}^{supported}
++\epsilon\mathcal L_{latent-diag}
 \]
 
 其中：
 
-#### Latent recovery
+#### Observation anchor
 
 \[
-\mathcal L_{latent}
-=
-\left\|M^*\odot(\hat Z-Z^*)\right\|_1
-+\lambda_{cos}(1-\cos(\hat Z,Z^*))
+M_{obs}=M_{gnd}^{sparse},\qquad
+M_{fill}=M_{dense-geometry}\land\neg M_{obs}
 \]
 
-- `M*` 是 dense-ground reference coverage；
-- 对 sparse ground 已观测和未观测区域分别记录 loss；
-- 如果 unobserved 区域的全 latent 匹配过强，可降低其权重，但不添加复杂概率模型；
-- latent encoder/decoder 固定后，latent distance 才具有解释性。
+- `M_obs` 上约束 `Z_hat` 不偏离 `Z_gnd_sparse`；
+- `M_fill` 上通过同一个 frozen height readout 监督几何补全；
+- 全 tensor `Z_hat-Z_star` 只保留为很小的 regularizer/诊断，不作为主目标。
 
 #### Frozen render loss
 
@@ -537,11 +557,15 @@ tile ID 或绝对 GPS。可学习的逐 cell 空间模板若作为额外诊断�
 \hat I_t=R_{frozen}(\hat Z,T_t)
 \]
 
-对未进入 dense/sparse source 的 target 计算 RGB/LPIPS。
+全图只强约束低频布局；高频外观只在 target pixel 反投影到 `M_obs` 的区域
+约束。反投影 depth 由 frozen dense-ground renderer 稠密提供，并在 target
+LiDAR-valid pixel 处用公制真值覆盖。卫星不可见立面的真实高频纹理不作强监督。
 
 #### Frozen geometry loss
 
-使用同一个 frozen geometry decoder 输出 depth/density/occupancy，并与 LiDAR 对齐。
+使用 Stage A 唯一的 frozen relative-height decoder，在 `M_fill` 与 LiDAR
+relative-height target 对齐。Satellite 自带 height auxiliary 默认权重为 0，
+不能作为主几何证据旁路。
 
 ### Stage B 验收
 
@@ -998,10 +1022,18 @@ for tile in loader:
         target.K,
         target.T_world_cam,
     )
+    height_pred = frozen_height_decoder(z_hat)
+    m_obs = sparse_mask
+    m_fill = dense_geometry_mask & ~m_obs
+    teacher_depth = frozen_renderer(z_star, target.K, target.T_world_cam).depth
+    teacher_depth[target.depth_mask] = target.depth[target.depth_mask]
+    supported_pixels = backproject_and_sample(teacher_depth, m_obs)
 
-    loss = latent_loss(z_hat, z_star, ref_mask)
-    loss += render_loss(rgb_pred, target.rgb, target.static_mask)
-    loss += geometry_loss(depth_pred, target.depth, target.depth_mask)
+    loss = latent_anchor(z_hat, z_sparse, m_obs)
+    loss += geometry_fill_loss(height_pred, relative_height, m_fill)
+    loss += low_frequency_rgb_loss(rgb_pred, target.rgb)
+    loss += supported_high_frequency_loss(rgb_pred, target.rgb, supported_pixels)
+    loss += 0.01 * latent_loss_diagnostic(z_hat, z_star)
     loss.backward()
 ```
 

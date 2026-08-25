@@ -71,7 +71,7 @@ def main():
             if count[r, c] > 0.5:
                 x, y = c, r
                 draw.point((x, y), fill=(255, 64, 64))
-    T = s["target_T_world_cam"].numpy()
+    T = s["target_T_world_cam"][0].numpy()
     tx, ty = world_to_px([T[0, 3], T[1, 3]])
     fwd = T[:3, 0]  # camera x-axis in world (forward)
     fx, fy = world_to_px([T[0, 3] + fwd[0] * 8, T[1, 3] + fwd[1] * 8])

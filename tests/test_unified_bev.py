@@ -1,20 +1,49 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from tempfile import TemporaryDirectory
+from pathlib import Path
 
 import numpy as np
 import torch
 
 from world3d.geo.sat_alignment import SatSpec
+from world3d.unified_bev.checkpoints import (
+    GEOMETRY_TARGET_VERSION,
+    STAGE_A_SCHEMA_VERSION,
+    STAGE_B_SCHEMA_VERSION,
+    compute_stage_a_fingerprint,
+    validate_stage_a_checkpoint,
+    validate_stage_a_dataset,
+    validate_stage_b_checkpoint,
+)
 from world3d.unified_bev.geometry import (
     bev_grid_from_world_xy,
     bilinear_splat,
+    geometry_supervision_support,
     height_statistics,
     image_uv_to_grid,
+    observation_partition,
     ray_distance_to_camera_z,
+    relative_height_map,
     se3_inverse,
+    target_pixels_supported_by_bev,
+)
+from world3d.unified_bev.losses import (
+    high_frequency_masked_l1,
+    low_frequency_l1,
+    masked_smooth_l1,
+)
+from world3d.unified_bev.data import (
+    FRONT_CROP_OVERLAP,
+    FRONT_CROP_WIDTH,
+    VIEW_CAMERA_IDS,
+    VIEW_LAYOUT_VERSION,
+    centered_two_crop_starts,
+    scaled_crop_intrinsics,
 )
 from world3d.unified_bev.models import (
+    CompletionOutput,
     ColumnFieldDecoder,
     GroundBEVEncoder,
     LatentCompletion,
@@ -22,6 +51,7 @@ from world3d.unified_bev.models import (
     nadir_distance,
     satellite_bev_crop,
 )
+from world3d.unified_bev.readouts import BEVHeightDecoder, freeze_module
 from scripts.eval_unified_bev_probe import (
     depth_metrics,
     per_item_ssim,
@@ -82,6 +112,12 @@ def test_decoder_and_ground_shapes():
     assert rgb.shape == (B, 3, H, W)
     assert depth.shape == opacity.shape == (B, H, W)
     assert torch.isfinite(rgb).all() and torch.isfinite(depth).all()
+    rgb2, depth2, opacity2 = dec.render(
+        z, K[:, None].expand(-1, 2, -1, -1), T[:, None].expand(-1, 2, -1, -1),
+        torch.zeros(B, 2), tile_size_m=32.0, image_size=(W, H), far_m=10.0,
+    )
+    assert rgb2.shape == (B, 2, 3, H, W)
+    assert depth2.shape == opacity2.shape == (B, 2, H, W)
 
 
 def test_bev_grid_matches_splat_convention():
@@ -122,6 +158,72 @@ def test_height_statistics_are_true_mean_and_variance():
     assert float(h_mean[0, 0, 3, 3]) == 0.0  # empty cell stays zero
 
 
+def test_relative_height_is_translation_invariant_and_ignores_empty_cells():
+    points = torch.tensor([[[
+        [0.5, 0.5, 100.0], [1.5, 0.5, 101.0],
+        [0.5, 1.5, 105.0], [1.5, 1.5, 110.0],
+    ]]])
+    valid = torch.ones(1, 1, 4, dtype=torch.bool)
+    args = (valid, torch.zeros(1, 2), 1.0, 4, 4)
+    relative, support, ground = relative_height_map(points, *args)
+    shifted, shifted_support, shifted_ground = relative_height_map(
+        points + points.new_tensor([0.0, 0.0, 100.0]), *args,
+    )
+    assert torch.equal(support, shifted_support)
+    assert torch.allclose(relative, shifted, atol=1e-5)
+    assert torch.allclose(shifted_ground - ground, torch.tensor(100.0), atol=1e-5)
+    assert torch.equal(relative[~support], torch.zeros_like(relative[~support]))
+    assert not torch.all(relative[support] == 30.0), "absolute KITTI altitude must not saturate the target"
+
+
+def test_observation_partition_is_disjoint_and_geometry_bounded():
+    sparse = torch.tensor([[[[1, 0], [1, 0]]]], dtype=torch.bool)
+    dense = torch.tensor([[[[1, 1], [0, 0]]]], dtype=torch.bool)
+    observed, fill = observation_partition(sparse, dense)
+    assert torch.equal(observed, sparse)
+    assert torch.equal(fill, torch.tensor([[[[0, 1], [0, 0]]]], dtype=torch.bool))
+    assert not (observed & fill).any()
+    assert not (fill & ~dense).any()
+
+
+def test_geometry_supervision_requires_dense_lift_and_height_label():
+    dense_lift = torch.tensor([[[[1, 1], [0, 1]]]], dtype=torch.bool)
+    height_label = torch.tensor([[[[1, 0], [1, 1]]]], dtype=torch.bool)
+    support = geometry_supervision_support(dense_lift, height_label)
+    assert torch.equal(
+        support, torch.tensor([[[[1, 0], [0, 1]]]], dtype=torch.bool),
+    )
+    sparse = torch.tensor([[[[1, 0], [0, 0]]]], dtype=torch.bool)
+    _, fill = observation_partition(sparse, support)
+    assert torch.equal(fill, torch.tensor([[[[0, 0], [0, 1]]]], dtype=torch.bool))
+
+
+def test_target_pixel_support_uses_backprojected_world_xy():
+    depth = torch.ones(1, 2, 2)
+    valid = torch.ones_like(depth, dtype=torch.bool)
+    # Pixel centers (0.5,0.5)..(1.5,1.5) at z=1 backproject to the same
+    # world XY with this unit-intrinsic convention.
+    K = torch.eye(3).unsqueeze(0)
+    T = torch.eye(4).unsqueeze(0)
+    support = torch.zeros(1, 1, 2, 2)
+    support[0, 0, 0, 0] = 1.0
+    mask = target_pixels_supported_by_bev(
+        depth, valid, K, T, torch.zeros(1, 2), 2.0, support,
+    )
+    assert mask.shape == (1, 1, 2, 2)
+    assert mask[0, 0, 0, 0]
+    assert int(mask.sum()) == 1
+    multi = target_pixels_supported_by_bev(
+        depth[:, None].expand(-1, 2, -1, -1),
+        valid[:, None].expand(-1, 2, -1, -1),
+        K[:, None].expand(-1, 2, -1, -1),
+        T[:, None].expand(-1, 2, -1, -1),
+        torch.zeros(1, 2), 2.0, support,
+    )
+    assert multi.shape == (1, 2, 1, 2, 2)
+    assert int(multi.sum()) == 2
+
+
 def test_ray_distance_is_converted_to_camera_z():
     distance = torch.tensor([10.0])
     direction = torch.tensor([[0.6, 0.0, 0.8]])
@@ -152,7 +254,7 @@ def test_satellite_metric_perturbations_have_expected_direction():
 
 
 def test_random_sparse_source_choices_are_validated():
-    assert parse_source_choices("1,2,4,8", fixed=2, dense=8) == (1, 2, 4, 8)
+    assert parse_source_choices("1,2,4", fixed=2, dense=8) == (1, 2, 4)
     assert parse_source_choices(None, fixed=2, dense=8) == (2,)
     try:
         parse_source_choices("1,16", fixed=2, dense=8)
@@ -160,6 +262,12 @@ def test_random_sparse_source_choices_are_validated():
         pass
     else:
         raise AssertionError("out-of-range source choice must fail")
+    try:
+        parse_source_choices("8", fixed=2, dense=8)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("dense identity source count must be evaluation-only")
 
 
 def test_kitti360_satellite_spec():
@@ -190,12 +298,15 @@ def test_completion_identity_at_dense_sources():
     for mode in ("residual", "coordinate_only"):
         module = _make_completion(mode)
         out = module(z_sat, z_gnd, coverage, n_sparse=8, dense_sources=8)
-        assert torch.equal(out, z_gnd), mode
+        assert isinstance(out, CompletionOutput)
+        assert torch.equal(out.latent, z_gnd), mode
+        assert torch.equal(out.correction, torch.zeros_like(z_gnd))
+        assert torch.equal(out.ground_support, coverage)
     assert torch.equal(
-        _make_completion("satellite_only")(z_sat, z_gnd, coverage, 8, 8), z_sat
+        _make_completion("satellite_only")(z_sat, z_gnd, coverage, 8, 8).latent, z_sat
     )
     assert torch.equal(
-        _make_completion("ground_only")(z_sat, z_gnd, coverage, 8, 8), z_gnd
+        _make_completion("ground_only")(z_sat, z_gnd, coverage, 8, 8).latent, z_gnd
     )
     module = _make_completion("residual")
     for bad in (0, 9):
@@ -207,23 +318,28 @@ def test_completion_identity_at_dense_sources():
             raise AssertionError(f"n_sparse={bad} must be rejected")
 
 
-def test_completion_conf_range_and_prior_routing():
+def test_completion_write_gate_range_and_prior_routing():
     z_gnd = torch.randn(1, 8, 12, 12)
     coverage = (torch.rand(1, 1, 12, 12) > 0.6).float()
     z_sat_a, z_sat_b = torch.randn(1, 8, 12, 12), torch.randn(1, 8, 12, 12)
 
     residual = _make_completion("residual")
-    conf = residual.conf(torch.cat([z_gnd, coverage], dim=1))
-    assert conf.shape == (1, 1, 12, 12)
-    assert 0.0 <= float(conf.min()) and float(conf.max()) <= 1.0
+    output_a = residual(z_sat_a, z_gnd, coverage, 2, 8)
+    output_b = residual(z_sat_b, z_gnd, coverage, 2, 8)
+    gate = output_a.write_gate
+    assert gate.shape == (1, 1, 12, 12)
+    assert 0.0 <= float(gate.min()) and float(gate.max()) <= 1.0
+    assert not torch.allclose(gate, output_b.write_gate), \
+        "the auditable write gate must be able to react to satellite content"
+    assert torch.allclose(output_a.latent, z_gnd + output_a.correction)
     assert not torch.allclose(
-        residual(z_sat_a, z_gnd, coverage, 2, 8),
-        residual(z_sat_b, z_gnd, coverage, 2, 8),
+        output_a.latent,
+        output_b.latent,
     ), "residual mode must consume satellite content"
 
     coord = _make_completion("coordinate_only")
-    first = coord(z_sat_a, z_gnd, coverage, 2, 8)
-    assert torch.equal(first, coord(z_sat_b, z_gnd, coverage, 2, 8)), \
+    first = coord(z_sat_a, z_gnd, coverage, 2, 8).latent
+    assert torch.equal(first, coord(z_sat_b, z_gnd, coverage, 2, 8).latent), \
         "coordinate_only must be satellite-blind"
 
 
@@ -250,10 +366,10 @@ def test_coordinate_only_uses_fixed_metric_relative_xy():
     coverage = (torch.rand(1, 1, 12, 12) > 0.6).float()
     z_sat = torch.randn_like(z_gnd)
     with_xy = _make_completion("coordinate_only").eval()
-    output_with_xy = with_xy(z_sat, z_gnd, coverage, 2, 8)
+    output_with_xy = with_xy(z_sat, z_gnd, coverage, 2, 8).latent
     with torch.no_grad():
         with_xy.coord_embed.zero_()
-    assert not torch.equal(output_with_xy, with_xy(z_sat, z_gnd, coverage, 2, 8)), \
+    assert not torch.equal(output_with_xy, with_xy(z_sat, z_gnd, coverage, 2, 8).latent), \
         "fixed XY must be routed through the shared delta path"
 
 
@@ -264,9 +380,90 @@ def test_completion_alpha_schedule_scales_correction():
     z_sat = torch.randn(1, 8, 12, 12)
     coverage = (torch.rand(1, 1, 12, 12) > 0.6).float()
     module = _make_completion("residual")
-    at2 = module(z_sat, z_gnd, coverage, 2, 8) - z_gnd
-    at4 = module(z_sat, z_gnd, coverage, 4, 8) - z_gnd
+    at2 = module(z_sat, z_gnd, coverage, 2, 8).correction
+    at4 = module(z_sat, z_gnd, coverage, 4, 8).correction
     assert torch.allclose(at2, 1.5 * at4, atol=1e-6)
+
+
+def test_frozen_bev_height_decoder_is_shared_readout_not_a_gradient_barrier():
+    decoder = freeze_module(BEVHeightDecoder(latent_channels=8, width=16))
+    latent = torch.randn(2, 8, 16, 16, requires_grad=True)
+    prediction = decoder(latent)
+    assert prediction.shape == (2, 1, 16, 16)
+    prediction.square().mean().backward()
+    assert latent.grad is not None and torch.isfinite(latent.grad).all()
+    assert all(not parameter.requires_grad for parameter in decoder.parameters())
+    assert all(parameter.grad is None for parameter in decoder.parameters())
+
+
+def test_observation_aware_losses_handle_empty_masks():
+    pred = torch.randn(1, 3, 16, 16, requires_grad=True)
+    target = torch.randn_like(pred)
+    empty = torch.zeros(1, 1, 16, 16, dtype=torch.bool)
+    loss = masked_smooth_l1(pred, target, empty)
+    assert float(loss) == 0.0 and loss.requires_grad
+    loss.backward(retain_graph=True)
+    assert pred.grad is not None
+    assert torch.isfinite(low_frequency_l1(pred, target, scale=8))
+    assert float(high_frequency_masked_l1(pred, target, empty, scale=8)) == 0.0
+    pred_views = pred[:, None].expand(-1, 2, -1, -1, -1)
+    target_views = target[:, None].expand_as(pred_views)
+    empty_views = empty[:, None].expand(-1, 2, -1, -1, -1)
+    assert torch.isfinite(low_frequency_l1(pred_views, target_views, scale=8))
+    assert float(high_frequency_masked_l1(
+        pred_views, target_views, empty_views, scale=8,
+    )) == 0.0
+
+
+def test_checkpoint_schema_binds_stage_b_to_exact_stage_a():
+    stage_a = {
+        "schema_version": STAGE_A_SCHEMA_VERSION,
+        "ground": {"weight": torch.arange(4, dtype=torch.float32)},
+        "decoder": {"weight": torch.ones(2)},
+        "geometry_decoder": {"weight": torch.zeros(3)},
+        "ground_config": {"family": "dense", "latent_channels": 64},
+        "renderer_config": {"latent_channels": 64, "hidden": 16, "samples": 4},
+        "geometry_decoder_config": {"latent_channels": 64, "width": 8},
+        "geometry_target_version": GEOMETRY_TARGET_VERSION,
+        "grid_config": {
+            "bev_size": 128, "bev_resolution_m": 0.5,
+            "tile_size_m": 64.0, "views_per_frame": 8, "target_views": 2,
+            "target_view_layout_version": "front2_v1",
+        },
+    }
+    stage_a["fingerprint"] = compute_stage_a_fingerprint(stage_a)
+    fingerprint = validate_stage_a_checkpoint(stage_a)
+    dataset = SimpleNamespace(
+        bev_size=128, bev_resolution_m=0.5, tile_size_m=64.0,
+        views_per_frame=8, target_views=2,
+        target_view_layout_version="front2_v1",
+    )
+    validate_stage_a_dataset(stage_a, dataset, dense_geometry_attached=True)
+    try:
+        validate_stage_a_dataset(stage_a, dataset, dense_geometry_attached=False)
+    except RuntimeError as error:
+        assert "ground family" in str(error)
+    else:
+        raise AssertionError("dense Stage A must reject a sparse-ground data path")
+    stage_b = {
+        "schema_version": STAGE_B_SCHEMA_VERSION,
+        "stage_a_fingerprint": fingerprint,
+    }
+    validate_stage_b_checkpoint(stage_b, fingerprint)
+    try:
+        validate_stage_b_checkpoint(stage_b, "different-stage-a")
+    except RuntimeError as error:
+        assert "different Stage-A" in str(error)
+    else:
+        raise AssertionError("Stage B must be bound to its exact Stage A")
+
+    stage_a["ground"]["weight"] = stage_a["ground"]["weight"] + 1.0
+    try:
+        validate_stage_a_checkpoint(stage_a)
+    except RuntimeError as error:
+        assert "fingerprint mismatch" in str(error)
+    else:
+        raise AssertionError("mutated Stage-A weights must invalidate the checkpoint")
 
 
 def test_road_frame_shift_decomposes_along_and_cross():
@@ -399,10 +596,12 @@ def test_heightmap_prior_contract_and_cross_attention():
                                   dim=64, depth=2, heads=4, patch=8, tile_size_m=64.0)
     sat = torch.rand(1, 3, 256, 256)
     z_gnd = torch.randn(1, 16, 64, 64)
-    prior, h_pred, _ = enc(sat, z_gnd, 64.0, 0.196)
+    output = enc(sat, z_gnd, 64.0, 0.196)
+    assert len(output) == 2, "the satellite branch must not emit fake zero uncertainty"
+    prior, h_pred = output
     assert prior.shape == (1, 16, 64, 64)
     assert h_pred.shape == (1, 1, 64, 64)
-    assert float(h_pred.min()) >= 0.0 and float(h_pred.max()) <= 60.0
+    assert torch.isfinite(h_pred).all()
     # cross-attention is live: changing the street latent must change the prior
     z2 = z_gnd + torch.randn_like(z_gnd) * 0.1
     assert not torch.allclose(enc(sat, z_gnd, 64.0, 0.196)[0], enc(sat, z2, 64.0, 0.196)[0])
@@ -471,49 +670,236 @@ def test_dense_encoder_shapes_and_coverage():
     assert float(cov2.mean()) == 0.0
 
 
-def test_cross_view_consistency_weights():
-    """Two views of the same wall: agreeing pixels get full endorsement;
-    a pixel whose depth disagrees with the other view drops toward the
-    outlier floor."""
-    from world3d.unified_bev.models import cross_view_consistency, unproject_dense
-    B, N, H, W = 1, 2, 8, 8
-    fx = 8.0
-    K = torch.tensor([[[fx, 0, W / 2], [0, fx, H / 2], [0, 0, 1.0]]]).expand(B, N, 3, 3).contiguous()
-    T = torch.zeros(B, N, 4, 4)
-    T[..., 0, 0] = 1.0
-    T[..., 1, 2] = 1.0
-    T[..., 2, 1] = -1.0
-    T[..., 3, 3] = 1.0
-    T[:, 1, 1, 3] = 0.0  # second view laterally offset for parallax
-    depth = torch.full((B, N, H, W), 10.0)
-    # one disagreeing pixel in view 0: other view claims 20m there
-    depth_b = depth.clone()
-    depth_b[:, 1, 4, 4] = 20.0
-    conf = torch.ones(B, N, H, W)
-    gate = conf > 0
-    pts = unproject_dense(depth_b, K, T)
-    w = cross_view_consistency(pts, depth_b, K, T, gate)
-    w_ok = w[0, 0, 2, 2]
-    w_bad = w[0, 0, 4, 4]
-    assert w_ok > 0.9, f"agreed pixel should be endorsed, got {w_ok}"
-    assert w_bad < 0.5, f"disagreed pixel should be suppressed, got {w_bad}"
-    assert w_bad >= 0.2 - 1e-6, "floor must hold"
+def test_metric3d_two_crops_are_centered_on_optical_axis():
+    starts = centered_two_crop_starts(
+        1408, FRONT_CROP_WIDTH, FRONT_CROP_OVERLAP, 682.049453,
+    )
+    assert starts == [158, 646]
+    union_center = (starts[0] + starts[1] + 560) / 2.0
+    assert abs(union_center - 682.049453) < 0.5
 
 
-def test_splat_point_weights_suppress_outliers():
-    """A cell receiving one endorsed and one hallucinated point should tilt
-    toward the endorsed point's value when point_weights are used."""
-    from world3d.unified_bev.geometry import bilinear_splat
-    vals = torch.tensor([[[[5.0], [50.0]]]])            # (B=1,N=1,P=2,C=1)
-    xy = torch.tensor([[[[1.25, 1.75], [1.75, 1.75]]]])  # both near same cell
-    valid = torch.ones(1, 1, 2, dtype=torch.bool)
-    org = torch.zeros(1, 2)
-    base, _ = bilinear_splat(vals, xy, valid, origin_xy=org, resolution_m=1.0, height=4, width=4)
-    wgt = torch.tensor([[[[1.0, 0.01]]]])
-    weighted, _ = bilinear_splat(vals, xy, valid, origin_xy=org, resolution_m=1.0,
-                                 height=4, width=4, point_weights=wgt)
-    # unweighted mean ~27.5; weighted should sit near 5
-    assert float(weighted.abs().mean()) < float(base.abs().mean())
-    c = 2
-    got = weighted[0, 0, 1, 1]  # main bilinear cell for both points
-    assert 4.0 < float(got) < 10.0, float(got)
+def test_front2_intrinsics_share_cam0_center_and_shift_principal_point():
+    K = np.array([
+        [552.554261, 0.0, 682.049453],
+        [0.0, 552.554261, 238.769549],
+        [0.0, 0.0, 1.0],
+    ])
+    starts = centered_two_crop_starts(1408, 560, 72, K[0, 2])
+    left = scaled_crop_intrinsics(K, (1408, 376), starts[0], 560, (160, 96))
+    right = scaled_crop_intrinsics(K, (1408, 376), starts[1], 560, (160, 96))
+    assert VIEW_LAYOUT_VERSION == "front2_left3_right3_v1"
+    assert VIEW_CAMERA_IDS == (0, 0, 1, 1, 1, 2, 2, 2)
+    assert float(left[0, 2]) > 80.0
+    assert float(right[0, 2]) < 80.0
+    assert torch.isclose(left[0, 0], right[0, 0])
+    assert torch.isclose(left[1, 1], right[1, 1])
+
+
+def test_vggt_motion_scale_recovers_metric_gauge():
+    from scripts.build_vggt_street_cache import estimate_motion_metric_scale
+
+    pred_centers = torch.tensor([
+        [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 1.0, 0.0],
+        [2.0, 1.0, 0.0],  # duplicate virtual-view center must not bias the fit
+    ])
+    pred_w2c = torch.eye(4).repeat(4, 1, 1)[:, :3]
+    pred_w2c[:, :3, 3] = -pred_centers
+    R = torch.tensor([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    gt_centers = 3.5 * (pred_centers @ R.T) + torch.tensor([10.0, -4.0, 2.0])
+    gt_world_cam = torch.eye(4).repeat(4, 1, 1)
+    gt_world_cam[:, :3, 3] = gt_centers
+
+    fit = estimate_motion_metric_scale(pred_w2c, gt_world_cam)
+    assert abs(float(fit["scale"]) - 3.5) < 1e-5
+    assert float(fit["alignment_rmse_m"]) < 1e-5
+    aligned = (
+        pred_centers * fit["scale"] @ fit["alignment_rotation"].T
+        + fit["alignment_translation_m"]
+    )
+    assert torch.allclose(aligned[:3], gt_centers[:3], atol=1e-5)
+    assert fit["anchor_indices"].tolist() == [0, 1, 2]
+    assert fit["scale_source"] == "camera_rig"
+
+
+def test_vggt_scale_uses_vehicle_motion_for_multiframe_subset():
+    from scripts.build_vggt_street_cache import estimate_motion_metric_scale
+
+    # Eight views per frame but only three physical camera centers.  The
+    # predicted physical-camera centroid moves 2 VGGT units.  Ground-truth
+    # camera-center averages are deliberately inconsistent: metric scale must
+    # come from the explicit 6 m vehicle displacement, yielding exactly 3.
+    pred_centers = torch.tensor([
+        [-0.3, 0.0, 0.0], [-0.3, 0.0, 0.0],
+        [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
+        [0.3, 0.0, 0.0], [0.3, 0.0, 0.0], [0.3, 0.0, 0.0],
+        [1.7, 0.0, 0.0], [1.7, 0.0, 0.0],
+        [2.0, 0.0, 0.0], [2.0, 0.0, 0.0], [2.0, 0.0, 0.0],
+        [2.3, 0.0, 0.0], [2.3, 0.0, 0.0], [2.3, 0.0, 0.0],
+    ])
+    pred_w2c = torch.eye(4).repeat(16, 1, 1)[:, :3]
+    pred_w2c[:, :3, 3] = -pred_centers
+    gt_world_cam = torch.eye(4).repeat(16, 1, 1)
+    gt_world_cam[:, :3, 3] = pred_centers * 9.0
+    gt_world_vehicle = torch.eye(4).repeat(2, 1, 1)
+    gt_world_vehicle[1, 0, 3] = 6.0
+
+    fit = estimate_motion_metric_scale(
+        pred_w2c, gt_world_cam, views_per_frame=8,
+        gt_world_vehicle=gt_world_vehicle,
+        view_camera_ids=torch.tensor(VIEW_CAMERA_IDS),
+    )
+    assert abs(float(fit["scale"]) - 3.0) < 1e-5
+    assert fit["scale_source"] == "vehicle_motion"
+    assert fit["pair_count"] == 1
+
+
+def test_vggt_single_frame_averages_virtual_views_per_physical_camera():
+    from scripts.build_vggt_street_cache import estimate_motion_metric_scale
+
+    pred_centers = torch.tensor([
+        [-0.1, 0.0, 0.0], [0.1, 0.0, 0.0],
+        [0.4, 0.0, 0.0], [0.5, 0.0, 0.0], [0.6, 0.0, 0.0],
+        [0.9, 0.0, 0.0], [1.0, 0.0, 0.0], [1.1, 0.0, 0.0],
+    ])
+    pred_w2c = torch.eye(4).repeat(8, 1, 1)[:, :3]
+    pred_w2c[:, :3, 3] = -pred_centers
+    gt_world_cam = torch.eye(4).repeat(8, 1, 1)
+    gt_world_cam[:2, 0, 3] = 0.0
+    gt_world_cam[2:5, 0, 3] = 1.0
+    gt_world_cam[5:, 0, 3] = 2.0
+
+    fit = estimate_motion_metric_scale(
+        pred_w2c, gt_world_cam, views_per_frame=8,
+        view_camera_ids=torch.tensor(VIEW_CAMERA_IDS),
+    )
+    assert abs(float(fit["scale"]) - 2.0) < 1e-5
+    assert fit["scale_source"] == "camera_rig"
+
+
+def test_vggt_scale_reliability_labels_single_frame_and_motion_evidence():
+    from world3d.unified_bev.data import geometry_scale_reliability
+
+    assert geometry_scale_reliability("camera_rig", 3) == (
+        "single_frame_camera_rig_fallback"
+    )
+    assert geometry_scale_reliability("vehicle_motion", 1) == (
+        "single_baseline_vehicle_motion"
+    )
+    assert geometry_scale_reliability("vehicle_motion", 3) == (
+        "multi_baseline_vehicle_motion"
+    )
+
+
+def test_vggt_preprocessing_keeps_unit_range_and_aspect():
+    from scripts.build_vggt_street_cache import (
+        _resize_for_vggt,
+        parse_subset_specs,
+        vggt_confidence_score,
+    )
+
+    images = torch.rand(8, 3, 96, 160)
+    resized, original_hw = _resize_for_vggt(images, 518)
+    assert original_hw == (96, 160)
+    assert resized.shape == (8, 3, 308, 518)
+    assert float(resized.min()) >= 0.0 and float(resized.max()) <= 1.0
+    assert parse_subset_specs("0:1,0:2,0:2,4:4", 8) == [(0, 1), (0, 2), (4, 4)]
+    score = vggt_confidence_score(torch.tensor([1.0, 2.0, 11.0]))
+    assert 0.0 <= float(score.min()) and float(score.max()) <= 1.0
+    assert score[0] < score[1] < score[2]
+    constant = vggt_confidence_score(torch.ones(4, 8, 8))
+    assert torch.allclose(constant, torch.full_like(constant, 0.5))
+
+
+def test_joint_geometry_cache_requires_exact_subset():
+    from world3d.unified_bev.data import (
+        dense_geometry_from_blob,
+        dense_geometry_subset_qa,
+    )
+
+    entry = {
+        "depth": torch.ones(8, 2, 3),
+        "conf": torch.ones(8, 2, 3),
+        "metric_scale": torch.tensor(2.5),
+        "scale_source": "camera_rig",
+        "scale_pair_count": 3,
+        "scale_relative_mad": torch.tensor(0.1),
+        "pose_alignment_rmse_m": torch.tensor(0.2),
+    }
+    joint = {"geometry_model": "vggt", "subsets": {"s0_n1": entry}}
+    depth, conf = dense_geometry_from_blob(joint, 0, 1, 8)
+    assert depth.shape == conf.shape == (8, 2, 3)
+    qa = dense_geometry_subset_qa(joint, 0, 1)
+    assert qa["metric_scale"] == 2.5
+    assert qa["scale_reliability"] == "single_frame_camera_rig_fallback"
+    try:
+        dense_geometry_from_blob(joint, 0, 2, 7)
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("joint geometry must not be sliced from a larger inference")
+
+    legacy = {"depth": torch.arange(32).view(16, 1, 2), "conf": torch.ones(16, 1, 2)}
+    depth, _ = dense_geometry_from_blob(legacy, 1, 1, 8)
+    assert torch.equal(depth, legacy["depth"][8:16].float())
+
+
+def test_geometry_cache_identity_rejects_index_mismatch():
+    from world3d.unified_bev.data import validate_geometry_blob_identity
+
+    expected = {
+        "drive": "drive_a", "target_fid": 10, "source_fids": [1, 2, 3],
+        "view_layout_version": VIEW_LAYOUT_VERSION,
+    }
+    blob = {"sample_identity": dict(expected)}
+    validate_geometry_blob_identity(blob, expected)
+    wrong = dict(expected)
+    wrong["target_fid"] = 11
+    try:
+        validate_geometry_blob_identity(blob, wrong)
+    except RuntimeError as exc:
+        assert "sample mismatch" in str(exc)
+    else:
+        raise AssertionError("misindexed geometry cache must fail before use")
+    wrong_layout = dict(expected)
+    wrong_layout["view_layout_version"] = "legacy_front1"
+    try:
+        validate_geometry_blob_identity(blob, wrong_layout)
+    except RuntimeError as exc:
+        assert "sample mismatch" in str(exc)
+    else:
+        raise AssertionError("geometry cache view-layout mismatch must fail before use")
+
+
+def test_dense_geometry_attach_infers_frame_count_from_source_views():
+    from world3d.unified_bev.data import attach_dense_geometry
+
+    class CachedSample:
+        views_per_frame = 8
+
+        def __len__(self):
+            return 1
+
+        def __getitem__(self, _):
+            return {
+                "source_rgb": torch.zeros(16, 3, 2, 2),
+                "meta": {
+                    "drive": "drive_a", "target_fid": 10,
+                    "source_fids": [1, 2],
+                    "view_layout_version": VIEW_LAYOUT_VERSION,
+                },
+            }
+
+    with TemporaryDirectory() as tmp:
+        blob = {
+            "sample_identity": CachedSample()[0]["meta"],
+            "subsets": {
+                "s0_n2": {
+                    "depth": torch.ones(16, 2, 2),
+                    "conf": torch.ones(16, 2, 2),
+                },
+            },
+        }
+        torch.save(blob, Path(tmp) / "000000.pt")
+        sample = attach_dense_geometry(CachedSample(), tmp)[0]
+        assert sample["dense_depth"].shape == (16, 2, 2)

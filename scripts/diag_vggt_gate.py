@@ -1,19 +1,9 @@
 #!/usr/bin/env python3
-"""VGGT usability gate for the v2 unified-lift design.
+"""One-tile gate for joint-view, motion-metric VGGT geometry.
 
-The premise under test: a nadir satellite crop, fed to VGGT as one more posed
-view alongside the street views, yields depth whose structure reflects real
-building heights (nadir depth ~= camera height minus structure height), and
-VGGT's estimated camera geometry is consistent with our calibrated world.
-
-Reads one cached tile (street views + satellite + dense LiDAR points), runs a
-single VGGT forward over all views, and reports:
-  1. Pearson correlation of the satellite-view depth map (resampled to the BEV
-     grid) vs the dense-LiDAR h_mean map, on covered cells.  |r| >= ~0.3 with
-     the expected sign is the go signal for v2.
-  2. Camera-center RMSE after best similarity alignment of VGGT extrinsics to
-     GT world poses (gauge sanity for per-tile metric anchoring).
-  3. Wall time and GPU memory for a full-tile forward.
+This gate deliberately excludes satellite imagery: VGGT establishes the
+ground-view geometry used by Stage A, while satellite geometry enters through
+the separately trained Stage-B prior.
 """
 from __future__ import annotations
 
@@ -23,38 +13,45 @@ import time
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, "/media/shizhm/Lenovo/vggt")
 
 from vggt.models.vggt import VGGT
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from world3d.unified_bev.data import load_cached_unified_bev
-from world3d.unified_bev.geometry import height_statistics
-
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
+from scripts.build_vggt_street_cache import run_joint_subset
 
 
-def pearson(a: torch.Tensor, b: torch.Tensor) -> float:
-    a = a.flatten() - a.mean()
-    b = b.flatten() - b.mean()
-    denom = float(a.norm() * b.norm())
-    return float((a * b).sum() / denom) if denom > 1e-8 else 0.0
-
-
-def umeyama_rigid(src: torch.Tensor, dst: torch.Tensor) -> float:
-    """RMSE of dst after best similarity fit of src->dst (both (N,3))."""
-    src_c, dst_c = src - src.mean(0), dst - dst.mean(0)
-    cov = (dst_c.T @ src_c) / src.shape[0]
-    u, s, vh = torch.linalg.svd(cov)
-    d = torch.sign(torch.det(u @ vh))
-    dvec = torch.cat([torch.ones_like(s[:2]), d[None]])
-    r = u @ torch.diag(dvec) @ vh
-    scale = float((s * dvec).sum() / (src_c ** 2).sum())
-    aligned = (scale * (src_c @ r.T)) + dst.mean(0)
-    return float(((aligned - dst) ** 2).sum(dim=1).sqrt().mean())
+def lidar_depth_metrics(entry: dict, sample: dict, view_slice: slice) -> dict[str, float | int]:
+    predicted = entry["depth"].float()
+    errors, relatives, ratios = [], [], []
+    valid_count = 0
+    for local_view, source_view in enumerate(range(view_slice.start, view_slice.stop)):
+        valid = sample["source_points_valid"][source_view]
+        uv = sample["source_points_uv"][source_view][valid]
+        points = sample["source_points_world"][source_view][valid]
+        T = sample["source_T_world_cam"][source_view]
+        R, t = T[:3, :3], T[:3, 3]
+        target_z = ((points - t) @ R)[:, 2]
+        x = uv[:, 0].round().long().clamp(0, predicted.shape[-1] - 1)
+        y = uv[:, 1].round().long().clamp(0, predicted.shape[-2] - 1)
+        depth = predicted[local_view, y, x]
+        keep = (target_z > 0.5) & (depth > 0.5)
+        if keep.any():
+            target_z, depth = target_z[keep], depth[keep]
+            diff = (depth - target_z).abs()
+            errors.append(diff.square())
+            relatives.append(diff / target_z)
+            ratios.append(torch.maximum(depth / target_z, target_z / depth))
+            valid_count += int(keep.sum())
+    if not errors:
+        return {"points": 0, "absrel": float("nan"), "rmse": float("nan"), "delta1": float("nan")}
+    return {
+        "points": valid_count,
+        "absrel": float(torch.cat(relatives).mean()),
+        "rmse": float(torch.cat(errors).mean().sqrt()),
+        "delta1": float((torch.cat(ratios) < 1.25).float().mean()),
+    }
 
 
 def main():
@@ -62,74 +59,54 @@ def main():
     ap.add_argument("--weights", default="/home/shizhm/Downloads/vggt.pt")
     ap.add_argument("--cache", default="runs/cache_grad_2048_dir")
     ap.add_argument("--index", type=int, default=0)
-    ap.add_argument("--max_views", type=int, default=32)
+    ap.add_argument("--frame_start", type=int, default=0)
+    ap.add_argument("--frame_count", type=int, default=2)
     ap.add_argument("--resolution", type=int, default=518)
-    ap.add_argument("--no_sat", action="store_true", help="street views only (isolate satellite-view poisoning)")
+    ap.add_argument("--min_baseline_m", type=float, default=0.25)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
     device = torch.device(args.device)
 
-    model = VGGT().to(device)
-    sd = torch.load(args.weights, map_location="cpu", weights_only=False)
-    model.load_state_dict(sd.get("model", sd), strict=False)
+    ds = load_cached_unified_bev(args.cache)
+    sample = ds[args.index]
+    start = args.frame_start * ds.views_per_frame
+    stop = (args.frame_start + args.frame_count) * ds.views_per_frame
+    if stop > sample["source_rgb"].shape[0]:
+        raise ValueError("requested source subset exceeds the cached source pool")
+
+    model = VGGT(enable_point=False, enable_track=False).to(device)
+    state = torch.load(args.weights, map_location="cpu", weights_only=False)
+    model.load_state_dict(state.get("model", state), strict=False)
+    del state
     model.eval()
 
-    ds = load_cached_unified_bev(args.cache)
-    s = ds[args.index]
-    views = s["source_rgb"][: args.max_views]          # (V,3,96,160) in [0,1]
-    sat = s["satellite"]                                # (3,512,512) in [0,1]
-    n_street = views.shape[0]
-
-    mean = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
-    std = torch.tensor(IMAGENET_STD).view(1, 3, 1, 1)
-    parts = [F.interpolate(views, size=(args.resolution, args.resolution), mode="bilinear")]
-    if not args.no_sat:
-        parts.append(F.interpolate(sat[None], size=(args.resolution, args.resolution), mode="bilinear"))
-    batch = torch.cat(parts, dim=0)
-    batch = ((batch - mean) / std).to(device)
-
-    torch.cuda.reset_peak_memory_stats()
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
     t0 = time.time()
-    with torch.no_grad():
-        tokens, ps_idx = model.aggregator(batch[None])
-        depth_map, depth_conf = model.depth_head(tokens, batch[None], ps_idx)
-        pose_enc = model.camera_head(tokens)[-1]
-    elapsed = time.time() - t0
-    peak_gb = torch.cuda.max_memory_allocated() / 1e9
-
-    extri, _ = pose_encoding_to_extri_intri(pose_enc, batch.shape[-2:])
-    extri = extri[0].float().cpu()
-    depth_map = depth_map[0].float().cpu()
-
-    # --- Gate 1: nadir-view depth vs dense-LiDAR height map ---
-    bev = 128
-    nadir = F.interpolate(depth_map[-1, ..., 0][None, None], size=(bev, bev), mode="bilinear")[0, 0]
-    pts = s["source_points_world"][: args.max_views]
-    valid = s["source_points_valid"][: args.max_views]
-    flat_p = pts[valid]
-    h_mean, _ = height_statistics(
-        flat_p[None, None], torch.ones(1, flat_p.shape[0], dtype=torch.bool),
-        s["origin_xy"][None], 0.5, bev, bev,
+    entry = run_joint_subset(
+        model,
+        sample["source_rgb"][start:stop],
+        sample["source_T_world_cam"][start:stop],
+        args.resolution,
+        args.min_baseline_m,
+        ds.views_per_frame,
+        device,
+        gt_world_vehicle=sample["source_T_world_imu"][
+            args.frame_start:args.frame_start + args.frame_count
+        ],
+        view_camera_ids=torch.tensor(ds.view_camera_ids),
     )
-    covered = (h_mean[0, 0] != 0)
-    r = pearson(nadir[covered], h_mean[0, 0][covered])
-    r_all = pearson(nadir, h_mean[0, 0])
-
-    # --- Gate 2: camera geometry vs GT world poses ---
-    centers_vggt = torch.stack([
-        -extri[i, :3, :3].T @ extri[i, :3, 3] for i in range(n_street)
-    ])
-    gt = s["source_T_world_cam"][:n_street, :3, 3]
-    rmse = umeyama_rigid(centers_vggt, gt)
-
-    print(f"tile_index={args.index} street_views={n_street}+sat resolution={args.resolution}")
-    print(f"forward: {elapsed:.1f}s, peak GPU {peak_gb:.1f} GB")
-    print(f"GATE1 nadir-depth vs LiDAR h_mean: pearson_r={r:+.3f} (covered cells "
-          f"{int(covered.sum())}/{bev*bev}; r_all={r_all:+.3f})  [expect negative: depth~height-H]")
-    print(f"GATE2 camera centers after sim-align: RMSE={rmse:.2f} m over {n_street} views")
-    conf_street = depth_conf[0, :n_street, ..., 0] if depth_conf.dim() == 4 else depth_conf[0, :n_street]
-    print(f"depth_conf: street mean={float(conf_street.mean()):.1f}"
-          + (f", sat mean={float(depth_conf[0,-1,...,0].mean() if depth_conf.dim()==4 else depth_conf[0,-1].mean()):.1f}" if not args.no_sat else " (no_sat)"))
+    elapsed = time.time() - t0
+    metrics = lidar_depth_metrics(entry, sample, slice(start, stop))
+    peak_gb = (torch.cuda.max_memory_allocated(device) / 1e9 if device.type == "cuda" else 0.0)
+    print(f"tile={args.index} subset={args.frame_start}:{args.frame_count} views={stop-start}")
+    print(f"forward={elapsed:.2f}s peak_gpu={peak_gb:.2f}GB input_hw={entry['vggt_input_hw'].tolist()}")
+    print(f"metric_scale={float(entry['metric_scale']):.6f} source={entry['scale_source']} "
+          f"pairs={entry['scale_pair_count']} "
+          f"relative_mad={float(entry['scale_relative_mad']):.4f} "
+          f"pose_rmse={float(entry['pose_alignment_rmse_m']):.3f}m")
+    print(f"LiDAR points={metrics['points']} AbsRel={metrics['absrel']:.4f} "
+          f"RMSE={metrics['rmse']:.3f}m delta1={metrics['delta1']:.4f}")
 
 
 if __name__ == "__main__":

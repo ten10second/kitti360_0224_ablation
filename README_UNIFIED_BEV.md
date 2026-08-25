@@ -37,10 +37,59 @@ conda run -n maskgit python scripts/smoke_unified_bev.py \
   --drive 2013_05_28_drive_0007_sync
 
 conda run -n maskgit python scripts/check_unified_bev_replay.py \
-  --stage_a runs/unified_bev_stage_a_gpu_smoke/stage_a.pt
+  --stage_a runs/unified_bev_claim_probe_20260824/stage_a/stage_a.pt \
+  --geometry_cache runs/unified_bev_claim_probe_20260824/cache_vggt_test \
+  --manifest dataset_splits/kitti360_geofence_buffer30/test_manifest.jsonl \
+  --drive 2013_05_28_drive_0003_sync
 ```
 
-## Probe status (fixed-XY control, 2026-08-21)
+## Claim-aligned pipeline (2026-08-24)
+
+The supported main path is now:
+
+```bash
+bash scripts/run_unified_bev_claim_probe.sh
+```
+
+- Stage A trains one dense-ground representation together with one RGB/depth
+  renderer and one convolutional `BEVHeightDecoder` for signed local relative
+  height. The latter is not called DPT.
+- Every source frame uses `front2_left3_right3_v1`: two calibrated windows
+  from `image_00`, three tangent views from `image_02`, and three from
+  `image_03`. Front windows share cam0's optical center; each fisheye triplet
+  shares its own calibrated physical center.
+- Stage B freezes all three Stage-A modules and learns observation-aware
+  completion: ground anchoring on observed cells, frozen-height supervision on
+  fill cells, whole-image low-frequency RGB, and high-frequency RGB only where
+  target pixels backproject into sparse-ground support.
+- Stage-A checkpoints are schema-versioned and fingerprinted. Stage B, eval,
+  and C2 reject ground-family/grid mismatches and reject a Stage-B checkpoint
+  paired with a different Stage A.
+- `coordinate_only` uses fixed metric relative XY/Fourier features. The
+  satellite direct-height auxiliary defaults to zero; nadir rendering is QA
+  only; learned uncertainty and consistency-weighted splatting are absent.
+- The primary held-out comparison is aligned satellite versus sparse ground,
+  fixed XY, random satellite tile, and a 5 m cross-road shift at `Ns={1,2}`.
+  Geometry headline metrics are measured in dense-geometry-supported cells not
+  supported by sparse ground (`M_fill`).
+- VGGT scale provenance is recorded per exact source subset. `Ns=1` is retained
+  as an extreme-sparsity diagnostic and uses the calibrated camera-rig fallback
+  because one frame has no vehicle motion. Multi-frame scale is anchored to
+  measured source vehicle poses after virtual views are grouped by physical
+  camera.
+- VGGT cache v6 stores and validates the view layout, each tile's drive, target frame, and full
+  source-frame list before training/evaluation, so an index-compatible but
+  geographically wrong cache fails instead of silently contaminating a split.
+- RGB/depth targets use the same two calibrated `image_00` front crops queried
+  by one renderer. Schema-v3 checkpoints reject the legacy 1408x376-to-160x96
+  anisotropic target resize.
+
+Superseded date-stamped shell chains and historical post-hoc
+DPT/probe/adapted-decoder runners have been removed. The only supported
+training/evaluation orchestrator is `scripts/run_unified_bev_claim_probe.sh`;
+current VGGT QA, data preparation, smoke, and replay utilities remain.
+
+## Historical probe status (fixed-XY control, 2026-08-21)
 
 - Engineering checks (data/geometry, backprop, replay, frozen decoder): pass.
 - Stage A was retrained for 20k steps after fixing the double-divided height

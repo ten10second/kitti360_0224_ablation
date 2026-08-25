@@ -67,7 +67,15 @@ def main():
     attrs = {
         "bev_size": ds.bev_size, "bev_resolution_m": ds.bev_resolution_m,
         "tile_size_m": ds.tile_size_m, "views_per_frame": ds.views_per_frame,
+        "dense_source_count": ds.dense_source_count,
+        "sparse_source_count": ds.sparse_source_count,
         "image_size": ds.image_size,
+        "view_layout_version": ds.view_layout_version,
+        "target_view_layout_version": ds.target_view_layout_version,
+        "target_views": ds.target_views,
+        "view_camera_ids": ds.view_camera_ids,
+        "front_crop_width": ds.front_crop_width,
+        "front_crop_overlap": ds.front_crop_overlap,
     }
 
     samples = [None] * n

@@ -46,7 +46,9 @@ def main():
     )
     sat = SatelliteBEVEncoder(latent_channels=16, bev_height=ds.bev_size, bev_width=ds.bev_size)
     z_sat = sat(batch["satellite"], ds.tile_size_m, 0.196)
-    z_hat = LatentCompletion(channels=16)(z_sat, z, mask, n_sparse=2, dense_sources=args.dense_sources)
+    z_hat = LatentCompletion(channels=16)(
+        z_sat, z, mask, n_sparse=2, dense_sources=args.dense_sources,
+    ).latent
     assert rgb.shape == batch["target_rgb"].shape
     assert depth.shape == batch["target_depth"].shape
     assert z.shape == z_sat.shape == z_hat.shape

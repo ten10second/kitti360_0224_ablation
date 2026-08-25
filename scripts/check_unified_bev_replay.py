@@ -9,8 +9,16 @@ from pathlib import Path
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from world3d.unified_bev.data import UnifiedBEVDataset
-from world3d.unified_bev.models import ColumnFieldDecoder, GroundBEVEncoder
+from world3d.unified_bev.checkpoints import (
+    validate_stage_a_checkpoint,
+    validate_stage_a_dataset,
+)
+from world3d.unified_bev.data import UnifiedBEVDataset, attach_dense_geometry
+from world3d.unified_bev.models import (
+    ColumnFieldDecoder,
+    GroundBEVEncoder,
+    GroundDenseBEVEncoder,
+)
 
 
 def main():
@@ -21,21 +29,44 @@ def main():
     ap.add_argument("--drive", default="2013_05_28_drive_0007_sync")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--cache", default="runs/unified_bev_replay/z_star.pt")
+    ap.add_argument("--geometry_cache", default=None)
+    ap.add_argument("--dense_sources", type=int, default=8)
+    ap.add_argument("--max_points", type=int, default=4096)
+    ap.add_argument("--min_target_spacing_m", type=float, default=5.0)
     args = ap.parse_args()
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
     ckpt = torch.load(args.stage_a, map_location=device, weights_only=False)
+    validate_stage_a_checkpoint(ckpt)
     ds = UnifiedBEVDataset(args.manifest, lidar_root=args.lidar_root, drive=args.drive,
-                           max_samples=1, dense_source_count=4, sparse_source_count=2,
-                           image_size=(160, 96), max_points_per_view=512)
+                           max_samples=1, dense_source_count=args.dense_sources,
+                           sparse_source_count=2, image_size=(160, 96),
+                           max_points_per_view=args.max_points,
+                           min_target_spacing_m=args.min_target_spacing_m)
+    if args.geometry_cache:
+        ds = attach_dense_geometry(ds, args.geometry_cache)
+    validate_stage_a_dataset(
+        ckpt, ds, dense_geometry_attached=bool(args.geometry_cache),
+    )
     sample = ds[0]
     b = {k: (v.unsqueeze(0).to(device) if torch.is_tensor(v) else v) for k, v in sample.items()}
-    ground = GroundBEVEncoder(bev_height=ds.bev_size, bev_width=ds.bev_size).to(device)
-    decoder = ColumnFieldDecoder().to(device)
+    ground_config = dict(ckpt["ground_config"])
+    family = ground_config.pop("family")
+    ground_cls = GroundDenseBEVEncoder if family == "dense" else GroundBEVEncoder
+    ground = ground_cls(**ground_config).to(device)
+    decoder = ColumnFieldDecoder(**ckpt["renderer_config"]).to(device)
     ground.load_state_dict(ckpt["ground"]); decoder.load_state_dict(ckpt["decoder"])
     ground.eval(); decoder.eval()
     with torch.no_grad():
-        z_online, mask_online = ground(b["source_rgb"], b["source_points_world"], b["source_points_uv"],
-                                       b["source_points_valid"], b["origin_xy"], ds.bev_resolution_m)
+        if family == "dense":
+            z_online, mask_online = ground(
+                b["source_rgb"], b["source_K"], b["dense_depth"], b["dense_conf"],
+                b["source_T_world_cam"], b["origin_xy"], ds.bev_resolution_m,
+            )
+        else:
+            z_online, mask_online = ground(
+                b["source_rgb"], b["source_points_world"], b["source_points_uv"],
+                b["source_points_valid"], b["origin_xy"], ds.bev_resolution_m,
+            )
         rgb_online, depth_online, _ = decoder.render(z_online, b["target_K"], b["target_T_world_cam"],
                                                      b["origin_xy"], tile_size_m=ds.tile_size_m,
                                                      image_size=ds.image_size)

@@ -122,7 +122,6 @@ def bilinear_splat(
     resolution_m: float,
     height: int,
     width: int,
-    point_weights: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Splat point values onto a BEV grid with bilinear weights.
 
@@ -158,7 +157,7 @@ def bilinear_splat(
     ):
         xi, yi = x0 + dx, y0 + dy
         ok = valid & (xi >= 0) & (xi < width) & (yi >= 0) & (yi < height)
-        w = weight * ok.to(dtype) if point_weights is None else weight * ok.to(dtype) * point_weights.to(dtype)
+        w = weight * ok.to(dtype)
         index = (yi.clamp(0, height - 1) * width + xi.clamp(0, width - 1)).reshape(B, -1)
         weighted = (values * w[..., None]).reshape(B, -1, C).transpose(1, 2)
         acc.scatter_add_(2, index[:, None, :].expand(-1, C, -1), weighted)
@@ -193,6 +192,166 @@ def height_statistics(
     h_mean = stats[..., :1, :, :]
     h_var = (stats[..., 1:, :, :] - h_mean * h_mean).clamp_min(0)
     return h_mean, h_var
+
+
+def relative_height_map(
+    points_world: torch.Tensor,
+    points_valid: torch.Tensor,
+    origin_xy: torch.Tensor,
+    resolution_m: float,
+    height: int,
+    width: int,
+    *,
+    quantile: float = 0.1,
+    min_height_m: float = -2.0,
+    max_height_m: float = 30.0,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build one translation-invariant relative-height target per BEV cell.
+
+    World-Z in KITTI-360 is an absolute map altitude.  A geometry readout
+    should instead predict height relative to the local road/ground level.
+    The ground anchor is therefore estimated independently for every sample
+    from the low quantile of *covered* cell means.  Empty cells never enter
+    the quantile and are explicitly reset to zero after subtraction.
+
+    Returns:
+        ``height_relative``: ``(B,1,H,W)`` in meters.
+        ``valid_mask``: bool ``(B,1,H,W)`` marking cells with observations.
+        ``ground_z``: ``(B,1,1,1)`` absolute world-Z anchor in meters.
+    """
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError(f"quantile must be in [0,1], got {quantile}")
+    if min_height_m >= max_height_m:
+        raise ValueError("min_height_m must be smaller than max_height_m")
+    h_abs, count = bilinear_splat(
+        points_world[..., 2:3],
+        points_world[..., :2],
+        points_valid,
+        origin_xy=origin_xy,
+        resolution_m=resolution_m,
+        height=height,
+        width=width,
+    )
+    valid_mask = count > 0
+    ground_z = h_abs.new_zeros((h_abs.shape[0], 1, 1, 1))
+    for batch_index in range(h_abs.shape[0]):
+        covered = h_abs[batch_index, 0][valid_mask[batch_index, 0]]
+        if covered.numel() > 0:
+            ground_z[batch_index, 0, 0, 0] = torch.quantile(
+                covered.float(), quantile,
+            ).to(h_abs.dtype)
+    height_relative = (h_abs - ground_z).clamp(min=min_height_m, max=max_height_m)
+    height_relative = torch.where(valid_mask, height_relative, torch.zeros_like(height_relative))
+    return height_relative, valid_mask, ground_z
+
+
+def observation_partition(
+    sparse_support: torch.Tensor,
+    dense_geometry_support: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return deterministic observed and geometry-completion BEV regions.
+
+    ``M_obs`` is exactly the sparse-ground support. ``M_fill`` contains cells
+    with a dense geometry target but no sparse-ground support.  The masks are
+    boolean and disjoint by construction; no learned confidence is involved.
+    """
+    if sparse_support.shape != dense_geometry_support.shape:
+        raise ValueError(
+            "support masks must have the same shape, got "
+            f"{tuple(sparse_support.shape)} and {tuple(dense_geometry_support.shape)}"
+        )
+    observed = sparse_support.bool()
+    fill = dense_geometry_support.bool() & ~observed
+    return observed, fill
+
+
+def geometry_supervision_support(
+    dense_geometry_support: torch.Tensor,
+    height_target_valid: torch.Tensor,
+) -> torch.Tensor:
+    """Cells where both the dense lift and metric height target are valid.
+
+    The frozen-height loss cannot supervise a VGGT-covered cell without a
+    LiDAR relative-height label, and it should not headline a LiDAR-only cell
+    that the dense reference encoder itself did not support.  Keeping this
+    intersection explicit prevents those two notions of "dense" from being
+    conflated in Stage B and evaluation.
+    """
+    if dense_geometry_support.shape != height_target_valid.shape:
+        raise ValueError(
+            "dense geometry and height-target masks must have the same shape, got "
+            f"{tuple(dense_geometry_support.shape)} and {tuple(height_target_valid.shape)}"
+        )
+    return dense_geometry_support.bool() & height_target_valid.bool()
+
+
+def target_pixels_supported_by_bev(
+    depth_z: torch.Tensor,
+    depth_valid: torch.Tensor,
+    K: torch.Tensor,
+    T_world_cam: torch.Tensor,
+    origin_xy: torch.Tensor,
+    tile_size_m: float,
+    bev_support: torch.Tensor,
+) -> torch.Tensor:
+    """Project target teacher-depth pixels into a BEV observation mask.
+
+    The returned ``(B,1,H,W)`` bool mask identifies target RGB pixels whose
+    backprojected world XY lies in a sparse-ground-supported BEV cell.  This
+    is the provenance mask used to restrict high-frequency appearance loss;
+    pixels without valid teacher depth are deliberately unsupported.
+    """
+    if K.ndim == 4:
+        batch_size, target_views = K.shape[:2]
+        if depth_z.shape[:2] != (batch_size, target_views):
+            raise ValueError("multi-target depth and K dimensions differ")
+        support = bev_support[:, None].expand(-1, target_views, -1, -1, -1).reshape(
+            batch_size * target_views, *bev_support.shape[1:]
+        )
+        origin = origin_xy[:, None].expand(-1, target_views, -1).reshape(-1, 2)
+        result = target_pixels_supported_by_bev(
+            depth_z.reshape(-1, *depth_z.shape[-2:]),
+            depth_valid.reshape(-1, *depth_valid.shape[-2:]),
+            K.reshape(-1, 3, 3), T_world_cam.reshape(-1, 4, 4), origin,
+            tile_size_m, support,
+        )
+        return result.reshape(batch_size, target_views, *result.shape[1:])
+    if depth_z.ndim == 4 and depth_z.shape[1] == 1:
+        depth_z = depth_z[:, 0]
+    if depth_valid.ndim == 4 and depth_valid.shape[1] == 1:
+        depth_valid = depth_valid[:, 0]
+    if depth_z.ndim != 3 or depth_valid.shape != depth_z.shape:
+        raise ValueError("depth_z and depth_valid must have shape (B,H,W)")
+    if bev_support.ndim != 4 or bev_support.shape[1] != 1:
+        raise ValueError("bev_support must have shape (B,1,Hb,Wb)")
+    B, H, W = depth_z.shape
+    device, dtype = depth_z.device, depth_z.dtype
+    yy, xx = torch.meshgrid(
+        torch.arange(H, device=device, dtype=dtype) + 0.5,
+        torch.arange(W, device=device, dtype=dtype) + 0.5,
+        indexing="ij",
+    )
+    pixels = torch.stack([xx, yy, torch.ones_like(xx)], dim=-1)
+    pixels = pixels.reshape(1, H * W, 3).expand(B, -1, -1)
+    rays_cam = pixels @ torch.linalg.inv(K.to(dtype)).transpose(-1, -2)
+    points_cam = rays_cam * depth_z.reshape(B, H * W, 1)
+    points_world = (
+        points_cam @ T_world_cam[:, :3, :3].to(dtype).transpose(-1, -2)
+        + T_world_cam[:, None, :3, 3].to(dtype)
+    )
+    grid = bev_grid_from_world_xy(
+        points_world[..., :2].reshape(B, H, W, 2),
+        origin_xy[:, None, None, :],
+        tile_size_m,
+    )
+    sampled = F.grid_sample(
+        bev_support.to(dtype), grid, mode="nearest", padding_mode="zeros",
+        align_corners=False,
+    )
+    finite_depth = torch.isfinite(depth_z) & (depth_z > 1e-3)
+    inside = (grid[..., 0] >= -1.0) & (grid[..., 0] <= 1.0) \
+        & (grid[..., 1] >= -1.0) & (grid[..., 1] <= 1.0)
+    return (sampled > 0.5) & depth_valid[:, None].bool() & finite_depth[:, None] & inside[:, None]
 
 
 def ray_distance_to_camera_z(distance: torch.Tensor, dirs_cam: torch.Tensor) -> torch.Tensor:

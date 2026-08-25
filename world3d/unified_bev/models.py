@@ -1,6 +1,7 @@
 """Small, explicit models for the two-stage unified BEV latent experiment."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Tuple
 
 import torch
@@ -13,6 +14,7 @@ from .geometry import (
     height_statistics,
     image_uv_to_grid,
     ray_distance_to_camera_z,
+    relative_height_map,
     render_volume,
 )
 
@@ -54,16 +56,16 @@ def unproject_dense(depth: torch.Tensor, K: torch.Tensor, T_world_cam: torch.Ten
 
 
 class GroundDenseBEVEncoder(nn.Module):
-    """v2 lift: every camera pixel carrying Metric3D metric depth is a world
-    point.
+    """Dense lift: every camera pixel carrying metric depth is a world point.
 
     Replaces the LiDAR-point-sampled lift (whose ~1k points/view left ~80% of
     the BEV unmeasured at Ns=1 and made z_gnd chain-dependent -- the C2
     verdict).  Here each view contributes its full pixel grid: features come
     from the shared image encoder at EVERY pixel, points from per-pixel
-    unprojection of the scale-anchored M3D depth cache, gated by M3D
-    confidence and physical depth bounds.  Multi-view agreement is resolved
-    by the splat's weighted mean; h_var records disagreement as uncertainty.
+    unprojection of a scale-anchored geometry cache (independent Metric3D or
+    joint-view VGGT), gated by geometry confidence and physical depth bounds.
+    Valid samples are aggregated with a plain per-cell bilinear mean; h_var
+    records measured height dispersion.
     Output contract matches ``GroundBEVEncoder`` (z, coverage).
     """
 
@@ -105,7 +107,7 @@ class GroundDenseBEVEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, N, _, H, W = images.shape
         P = H * W
-        # Guard against pathological M3D outputs (inf/negative depths on
+        # Guard against pathological geometry outputs (inf/negative depths on
         # padded borders, negative confidence): neutralize BEFORE unprojection
         # so invalid coordinates never reach the splat index math.
         # fp16 cache entries must be promoted before linalg.inv (Half unsupported)
@@ -125,19 +127,15 @@ class GroundDenseBEVEncoder(nn.Module):
         gate = ((dense_conf > self.conf_threshold)
                 & (dense_depth > self.min_depth_m)
                 & (dense_depth < self.max_depth_m)).view(B, N, P)
-        # Cross-view endorsement (MVS visibility check): suppresses per-view
-        # M3D disagreement before it becomes chain-level bias (C2 reversal).
-        cons = cross_view_consistency(
-            pts_w, dense_depth, K, T_world_cam,
-            gate.view(B, N, H, W),
-        ).view(B, N, P)
         bev, count = bilinear_splat(
             feat, pts[..., :2], gate,
             origin_xy=origin_xy, resolution_m=resolution_m,
             height=self.bev_height, width=self.bev_width,
-            point_weights=cons,
         )
-        h_mean, h_var = height_statistics(
+        h_mean, _, _ = relative_height_map(
+            pts, gate, origin_xy, resolution_m, self.bev_height, self.bev_width,
+        )
+        _, h_var = height_statistics(
             pts, gate, origin_xy, resolution_m, self.bev_height, self.bev_width,
         )
         coverage = (count > 0).to(bev.dtype)
@@ -211,7 +209,11 @@ class GroundBEVEncoder(nn.Module):
         # and variance so the column decoder can reason about vertical
         # spread instead of only average height.  bilinear_splat already
         # returns weighted means; no second division by the count.
-        h_mean, h_var = height_statistics(
+        h_mean, _, _ = relative_height_map(
+            points_world, points_valid, origin_xy, resolution_m,
+            self.bev_height, self.bev_width,
+        )
+        _, h_var = height_statistics(
             points_world, points_valid, origin_xy, resolution_m,
             self.bev_height, self.bev_width,
         )
@@ -262,70 +264,6 @@ def satellite_bev_crop(
     # BEV raster is south-up, so flip rows before resampling.
     crop = torch.flip(crop, dims=[-2])
     return F.interpolate(crop, size=(size, size), mode="bilinear", align_corners=False)
-
-
-def cross_view_consistency(
-    pts_w: torch.Tensor,
-    depth_maps: torch.Tensor,
-    K: torch.Tensor,
-    T_world_cam: torch.Tensor,
-    gate: torch.Tensor,
-    rel_tol: float = 0.15,
-    outlier_floor: float = 0.2,
-) -> torch.Tensor:
-    """Per-point cross-view endorsement weight, classical-MVS visibility check.
-
-    For every lifted pixel point of view i, project it into each other view j
-    and compare view j's predicted depth there with the point's own axial
-    distance.  Weight = fraction of in-bounds gated views agreeing within
-    ``rel_tol``; points no other view can see keep ``outlier_floor + 0.5`` so
-    genuine single-view surfaces (occlusion boundaries) survive with reduced
-    weight while M3D's per-view hallucinations get suppressed.  This is the
-    cheap consistency mechanism whose absence the dense-lift C2 reversal
-    exposed (chains averaged disagreeing dense measurements).
-
-    pts_w: (B,N,H,W,3); depth_maps/gate: (B,N,H,W); K: (B,N,3,3);
-    T_world_cam: (B,N,4,4).  Returns weights (B,N,H,W).
-    """
-    B, N, H, W = depth_maps.shape
-    device = depth_maps.device
-    dtype = torch.float32
-    pts = pts_w.to(dtype).reshape(B, N, H * W, 3)          # (B,Ni,P,3)
-    dd = depth_maps.to(dtype)
-    votes = torch.zeros(B, N, H * W, dtype=dtype, device=device)
-    voters = torch.zeros(B, N, H * W, dtype=dtype, device=device)
-    view_range = torch.arange(N, device=device)
-    for j in range(N):
-        if N > 1:
-            not_self = (view_range != j).view(1, N, 1).expand(B, N, H * W)
-        else:
-            not_self = torch.ones(B, N, H * W, dtype=torch.bool, device=device)
-        Kj = K[:, j].to(dtype)
-        Rj = T_world_cam[:, j, :3, :3].to(dtype)
-        tj = T_world_cam[:, j, :3, 3].to(dtype)
-        # p_world = R p_cam + t  =>  p_cam = (p_world - t) @ R
-        p_cam = ((pts - tj.view(B, 1, 1, 3)) @ Rj.view(B, 1, 3, 3))  # (B,Ni,P,3)
-        z = p_cam[..., 2]
-        front = z > 0.5
-        zc = z.clamp_min(1e-6)
-        u = p_cam[..., 0] / zc * Kj[:, 0, 0].view(B, 1, 1) + Kj[:, 0, 2].view(B, 1, 1) - 0.5
-        v = p_cam[..., 1] / zc * Kj[:, 1, 1].view(B, 1, 1) + Kj[:, 1, 2].view(B, 1, 1) - 0.5
-        ui = u.round().long()
-        vi = v.round().long()
-        inb = (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H) & front
-        flat = (vi.clamp(0, H - 1) * W + ui.clamp(0, W - 1))          # (B,Ni,P)
-        idx = flat + (j * H * W) + torch.arange(B, device=device)[:, None, None] * (N * H * W)
-        d_j = dd.reshape(B * N * H * W)[idx.clamp(0, B * N * H * W - 1)]
-        g_j = gate[:, j].reshape(B, 1, H * W).expand(B, N, H * W).to(dtype)
-        valid = inb & (g_j > 0) & not_self
-        agree = valid & ((z - d_j).abs() / z.clamp_min(0.5) < rel_tol)
-        votes = votes + agree.to(dtype)
-        voters = voters + valid.to(dtype)
-    endorse = votes / voters.clamp_min(1.0)
-    weight = outlier_floor + (1.0 - outlier_floor) * endorse
-    unseen = voters == 0
-    weight = torch.where(unseen, torch.full_like(weight, outlier_floor + 0.5), weight)
-    return weight.view(B, N, H, W)
 
 
 def nadir_distance(pred: torch.Tensor, ref: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -460,19 +398,17 @@ class _CrossAttentionBlock(nn.Module):
 
 
 class HeightMapSatellitePrior(nn.Module):
-    """CVS-pattern satellite prior: height-map regression on the BEV grid.
+    """Satellite latent prior with an optional relative-height auxiliary.
 
     Perspective/depth formulations of orthorectified imagery are a measured
     dead end (scripts/diag_vggt_gate.py: nadir depth vs LiDAR heights
     r=+0.01, depth_conf 1.0), matching Cross-View Splatter's motivation.
-    Here the satellite branch instead regresses a metric height map: its
-    tokens cross-attend to the street latent (both live on the same south-up
-    BEV grid, so the correspondence is exact by construction), the height
-    head is supervised by dense LiDAR h_mean acting as a per-tile "DEM", and
-    placement needs no projection at all -- ``satellite_bev_crop`` plus the
-    known meters-per-pixel already anchor cells to world XY.  The output
-    ``prior`` drops into the completion slot that z_sat occupied, interface
-    unchanged (identity gates unaffected: at Ns=N_dense alpha=0 discards it).
+    Tokens cross-attend to the sparse-ground latent on the same south-up grid;
+    metric placement comes from ``satellite_bev_crop`` and known mpp. The
+    ``prior`` enters latent completion. ``h_pred`` follows the signed local
+    relative-height convention but is auxiliary-only (default loss weight 0):
+    primary geometry evidence must be decoded from the completed latent by the
+    frozen Stage-A ``BEVHeightDecoder``.
 
     Method borrowing from Cross-View Splatter (height branch, cross-view
     attention, top-down consistency) must be cited explicitly.
@@ -505,7 +441,7 @@ class HeightMapSatellitePrior(nn.Module):
         self.register_buffer("pos", _patch_xy_pos_embed(dim, self.grid, patch, tile_size_m))
 
     def forward(self, sat: torch.Tensor, z_gnd: torch.Tensor, tile_size_m: float,
-                sat_m_per_px: float) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                sat_m_per_px: float) -> Tuple[torch.Tensor, torch.Tensor]:
         if abs(float(tile_size_m) - self.pos_tile_size_m) > 1e-6:
             raise ValueError(
                 f"tile_size_m {tile_size_m} does not match the positional encoding "
@@ -521,11 +457,12 @@ class HeightMapSatellitePrior(nn.Module):
         )
         full = F.interpolate(grid, size=(self.bev_height, self.bev_width),
                              mode="bilinear", align_corners=False)
-        # Heights are non-negative (meters above ground zero); clamp guards
-        # the far LiDAR-noise tail (single-return cells up to ~139 m).
-        h_pred = F.softplus(self.height_head(full)).clamp(max=60.0)
+        # Optional auxiliary only: use the same signed local-ground-relative
+        # convention as the frozen Stage-A geometry interface.  The primary
+        # geometry evidence must still be decoded from the completed latent.
+        h_pred = self.height_head(full)
         prior = self.prior_head(full)
-        return prior, h_pred, h_pred.new_zeros(h_pred.shape)
+        return prior, h_pred
 
 
 def fixed_relative_xy_encoding(
@@ -564,11 +501,20 @@ def fixed_relative_xy_encoding(
     return torch.stack(features, dim=0).unsqueeze(0)
 
 
-class LatentCompletion(nn.Module):
-    """Ground-anchored completion: a prior corrects the sparse-ground latent
-    only where the ground pathway is uncertain.
+@dataclass
+class CompletionOutput:
+    """Auditable output of one latent-completion forward pass."""
 
-    ``z_hat = z_gnd + alpha(Ns) * (1 - conf_gnd) * delta(prior, z_gnd, conf_gnd)``
+    latent: torch.Tensor
+    write_gate: torch.Tensor
+    correction: torch.Tensor
+    ground_support: torch.Tensor
+
+
+class LatentCompletion(nn.Module):
+    """Ground-anchored completion with deterministic observation provenance.
+
+    ``z_hat = z_gnd + alpha(Ns) * write_gate(prior,z_gnd,support) * delta(...)``
 
     ``alpha(Ns) = 1 - Ns / N_dense`` is exactly zero at the dense source
     count, so the completion degenerates to ``z_gnd`` bitwise (regression
@@ -576,8 +522,8 @@ class LatentCompletion(nn.Module):
     forced ``z_hat = z_sat`` on every cell outside the raw splat mask (~63%
     even at Ns=8), discarding the ground encoder's context-propagated
     information there; the dense-convergence gate was unpassable by
-    construction.  The confidence must stay a learned soft map: the raw
-    binary coverage is an input to it, never the fusion weight itself.
+    construction. ``write_gate`` is a learned update gate, not uncertainty;
+    ``ground_support`` remains the raw deterministic observation mask.
     """
 
     def __init__(
@@ -599,8 +545,8 @@ class LatentCompletion(nn.Module):
             "coord_embed",
             fixed_relative_xy_encoding(channels, bev_height, bev_width, tile_size_m),
         )
-        self.conf = nn.Sequential(
-            nn.Conv2d(channels + 1, channels, 3, padding=1),
+        self.write_gate = nn.Sequential(
+            nn.Conv2d(channels * 2 + 1, channels, 3, padding=1),
             nn.GroupNorm(8, channels),
             nn.GELU(),
             nn.Conv2d(channels, 1, 1),
@@ -618,23 +564,40 @@ class LatentCompletion(nn.Module):
         nn.init.zeros_(self.delta[-1].bias)
 
     def forward(self, z_sat: torch.Tensor, z_gnd: torch.Tensor, coverage: torch.Tensor,
-                n_sparse: int, dense_sources: int) -> torch.Tensor:
+                n_sparse: int, dense_sources: int) -> CompletionOutput:
         if not 1 <= int(n_sparse) <= int(dense_sources):
             raise ValueError(f"n_sparse must be in [1,{dense_sources}], got {n_sparse}")
         alpha = 1.0 - float(n_sparse) / float(dense_sources)
+        zero_gate = coverage.new_zeros(coverage.shape)
+        zero_correction = torch.zeros_like(z_gnd)
         if self.mode == "satellite_only":
-            return z_sat
+            return CompletionOutput(
+                latent=z_sat,
+                write_gate=torch.ones_like(coverage),
+                correction=z_sat - z_gnd,
+                ground_support=coverage,
+            )
         if self.mode == "ground_only":
-            return z_gnd
+            return CompletionOutput(z_gnd, zero_gate, zero_correction, coverage)
+        # Preserve the dense-source identity bit-for-bit and avoid a needless
+        # learned-gate forward whose result is multiplied by exact zero.
+        if alpha == 0.0:
+            return CompletionOutput(z_gnd, zero_gate, zero_correction, coverage)
         if self.mode == "coordinate_only":
             prior = self.coord_embed.expand(z_gnd.shape[0], -1, -1, -1)
         elif self.mode == "residual":
             prior = z_sat
         else:
             raise ValueError(f"unknown fusion mode: {self.mode}")
-        conf = self.conf(torch.cat([z_gnd, coverage], dim=1))
-        correction = self.delta(torch.cat([prior, z_gnd, conf], dim=1))
-        return z_gnd + alpha * (1.0 - conf) * correction
+        write_gate = self.write_gate(torch.cat([prior, z_gnd, coverage], dim=1))
+        raw_delta = self.delta(torch.cat([prior, z_gnd, write_gate], dim=1))
+        correction = alpha * write_gate * raw_delta
+        return CompletionOutput(
+            latent=z_gnd + correction,
+            write_gate=write_gate,
+            correction=correction,
+            ground_support=coverage,
+        )
 
 
 class ColumnFieldDecoder(nn.Module):
@@ -675,6 +638,27 @@ class ColumnFieldDecoder(nn.Module):
         near_m: float = 1.0,
         far_m: float = 60.0,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if K.ndim == 4:
+            batch_size, target_views = K.shape[:2]
+            if z.shape[0] != batch_size or T_world_cam.shape[:2] != (batch_size, target_views):
+                raise ValueError("multi-target K/T batch dimensions do not match the latent")
+            z_flat = z[:, None].expand(-1, target_views, -1, -1, -1).reshape(
+                batch_size * target_views, *z.shape[1:]
+            )
+            origin_flat = origin_xy[:, None].expand(-1, target_views, -1).reshape(
+                batch_size * target_views, 2
+            )
+            rgb, depth, opacity = self.render(
+                z_flat, K.reshape(-1, 3, 3), T_world_cam.reshape(-1, 4, 4), origin_flat,
+                tile_size_m=tile_size_m, image_size=image_size, near_m=near_m, far_m=far_m,
+            )
+            return (
+                rgb.reshape(batch_size, target_views, *rgb.shape[1:]),
+                depth.reshape(batch_size, target_views, *depth.shape[1:]),
+                opacity.reshape(batch_size, target_views, *opacity.shape[1:]),
+            )
+        if K.ndim != 3 or T_world_cam.ndim != 3:
+            raise ValueError("K/T must be batched single-target or multi-target tensors")
         W, H = image_size
         device, dtype = z.device, z.dtype
         yy, xx = torch.meshgrid(

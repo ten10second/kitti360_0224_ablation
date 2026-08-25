@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Build the Metric3D dense-depth cache for the unified-BEV v2 lift.
 
-Per cached tile (56 views), for every source view:
-  - perspective views (v % views_per_frame == 0): read the ORIGINAL
-    1408x376 image + original K, run M3D on three 560-wide standard-aspect
-    crops (overlap 72 px, principal point shifted per crop), reassemble the
-    strip, resize to 96x160;
+Per cached tile (64 views), for every source view:
+  - the first two views of each frame are centered windows from the same
+    image_00 camera; M3D runs on both original-resolution 560x376 crops and
+    each prediction is resized to its matching 96x160 source view;
   - fisheye virtual crops: run M3D on the cached 96x160 view directly
     (5:3 native aspect, 96% canvas fill);
   - per view: ONE LiDAR scale anchor (median of z_lidar/d_m3d over valid
@@ -18,8 +17,8 @@ grids does not change values, and the dataset's anisotropic K is exactly
 consistent with the axis-resized images, so unprojection from the cached
 96x160 grid stays geometrically exact.
 
-Storage per tile: depth (56,96,160) fp16, conf (56,96,160) fp16,
-scale (56,) fp32  (~3.6 MB; ~7 GB total).
+Storage per tile: depth (64,96,160) fp16, conf (64,96,160) fp16,
+scale (64,) fp32.
 """
 from __future__ import annotations
 
@@ -36,7 +35,16 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch.hub as hub
-from world3d.unified_bev.data import UnifiedBEVDataset, load_cached_unified_bev
+from world3d.unified_bev.data import (
+    FRONT_CROP_OVERLAP,
+    FRONT_CROP_WIDTH,
+    UnifiedBEVDataset,
+    VIEW_LAYOUT_VERSION,
+    centered_two_crop_starts,
+    geometry_sample_identity,
+    load_cached_unified_bev,
+    validate_geometry_blob_identity,
+)
 
 MEAN = torch.tensor([123.675, 116.28, 103.53]).view(1, 3, 1, 1)
 STD = torch.tensor([58.395, 57.12, 57.375]).view(1, 3, 1, 1)
@@ -75,7 +83,7 @@ def m3d_run(m3d, img01: torch.Tensor, fx, max_batch: int = 10) -> tuple[torch.Te
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="runs/cache_m3d_street")
+    ap.add_argument("--out", default="runs/cache_m3d_front2_centered")
     ap.add_argument("--cache", default="runs/cache_grad_2048_dir")
     ap.add_argument("--manifest", default="dataset_splits/kitti360_geofence_buffer30/train_manifest.jsonl")
     ap.add_argument("--device", default="cuda")
@@ -87,6 +95,11 @@ def main():
     ap.add_argument("--max_samples", type=int, default=32)
     ap.add_argument("--lidar_root", default="/media/shizhm/sda2/KITTI360_lidar/data_3d_raw")
     args = ap.parse_args()
+    if args.crop_w != FRONT_CROP_WIDTH or args.crop_overlap != FRONT_CROP_OVERLAP:
+        raise ValueError(
+            "Metric3D crop arguments must match the dataset front2 view layout: "
+            f"width={FRONT_CROP_WIDTH}, overlap={FRONT_CROP_OVERLAP}"
+        )
     device = torch.device(args.device)
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -123,16 +136,19 @@ def main():
     done = 0
     for i in range(args.start, n):
         dst = out_dir / f"{i:06d}.pt"
-        if dst.exists():
-            continue
         s = ds[i]
+        if dst.exists():
+            existing = torch.load(dst, map_location="cpu", weights_only=False)
+            validate_geometry_blob_identity(existing, s["meta"], context=str(dst))
+            continue
         n_views = s["source_rgb"].shape[0]
         depth = torch.zeros(n_views, 96, 160)
         conf = torch.zeros(n_views, 96, 160)
         scale = torch.ones(n_views)
+        perspective_crop_starts = None
 
         # ---- pass 1: all fisheye virtual views in ONE batched call ----
-        fish_idx = [v for v in range(n_views) if v % vpf != 0]
+        fish_idx = [v for v in range(n_views) if v % vpf >= 2]
         if fish_idx:
             fish_imgs = torch.stack([s["source_rgb"][v] for v in fish_idx]).to(device)
             fish_fx = torch.tensor([float(s["source_K"][v][0, 0]) for v in fish_idx], device=device)
@@ -157,9 +173,8 @@ def main():
                 depth[v] = d_v.clamp(0.0, 60.0).to(torch.float16).float()
                 conf[v] = c_v.clamp(min=0.0).to(torch.float16).float()
 
-        # ---- pass 2: perspective frames, crops batched per frame ----
+        # ---- pass 2: the two calibrated image_00 crops per frame ----
         for f in range(n_views // vpf):
-            v = f * vpf
             drive = s["meta"]["drive"]
             drive = drive[0] if isinstance(drive, list) else drive
             fids = s["meta"]["source_fids"]
@@ -176,47 +191,47 @@ def main():
             img = torch.from_numpy(
                 np.asarray(Image.open(src_path).convert("RGB"), dtype=np.float32) / 255.0
             ).permute(2, 0, 1).to(device)
-            H0, W0 = img.shape[-2:]
+            _, W0 = img.shape[-2:]
             W = args.crop_w
-            step = W - args.crop_overlap
-            starts = list(range(0, max(W0 - W, 0) + 1, step))
+            starts = centered_two_crop_starts(
+                W0, W, args.crop_overlap, float(K0[0, 2]),
+            )
+            perspective_crop_starts = starts
             crops = torch.stack([img[..., x0:x0 + W] for x0 in starts])
             d_all, c_all = m3d_run(m3d, crops, fx0)
-            strip_d = torch.zeros(H0, W0)
-            strip_c = torch.zeros(H0, W0)
-            strip_w = torch.zeros(H0, W0)
-            for k, x0 in enumerate(starts):
-                d_c, c_c = d_all[k].cpu(), c_all[k].cpu()
-                strip_d[:, x0:x0 + W] += d_c * c_c
-                strip_c[:, x0:x0 + W] += c_c
-                strip_w[:, x0:x0 + W] += 1.0
-            mm = strip_w > 0
-            strip_d[mm] = strip_d[mm] / strip_c[mm]
-            strip_c[mm] = strip_c[mm] / strip_w[mm]
-            d_v = F.interpolate(strip_d[None, None], size=(96, 160), mode="bilinear")[0, 0]
-            c_v = F.interpolate(strip_c[None, None], size=(96, 160), mode="bilinear")[0, 0]
-
-            valid = s["source_points_valid"][v]
-            uv = s["source_points_uv"][v][valid]
-            pw = s["source_points_world"][v][valid]
-            T = s["source_T_world_cam"][v]
-            R, t = T[:3, :3], T[:3, 3]
-            z_cam = ((pw - t) @ R)[:, 2]
-            px = uv[:, 0].round().long().clamp(0, 159)
-            py = uv[:, 1].round().long().clamp(0, 95)
-            dv_pts = d_v[py, px]
-            msk = (z_cam > 0.5) & (dv_pts > 0.05) & (c_v[py, px] > 0.05)
-            if int(msk.sum()) > 50:
-                sc = float((z_cam[msk] / dv_pts[msk]).median())
-                if 0.3 < sc < 4.0:
-                    d_v = d_v * sc
-                    scale[v] = sc
-            depth[v] = d_v.clamp(0.0, 60.0).to(torch.float16).float()
-            conf[v] = c_v.clamp(min=0.0).to(torch.float16).float()
+            for k, _ in enumerate(starts):
+                v = f * vpf + k
+                d_v = F.interpolate(
+                    d_all[k:k + 1, None], size=(96, 160), mode="bilinear", align_corners=False,
+                )[0, 0].cpu()
+                c_v = F.interpolate(
+                    c_all[k:k + 1, None], size=(96, 160), mode="bilinear", align_corners=False,
+                )[0, 0].cpu()
+                valid = s["source_points_valid"][v]
+                uv = s["source_points_uv"][v][valid]
+                pw = s["source_points_world"][v][valid]
+                T = s["source_T_world_cam"][v]
+                R, t = T[:3, :3], T[:3, 3]
+                z_cam = ((pw - t) @ R)[:, 2]
+                px = uv[:, 0].round().long().clamp(0, 159)
+                py = uv[:, 1].round().long().clamp(0, 95)
+                dv_pts = d_v[py, px]
+                msk = (z_cam > 0.5) & (dv_pts > 0.05) & (c_v[py, px] > 0.05)
+                if int(msk.sum()) > 50:
+                    sc = float((z_cam[msk] / dv_pts[msk]).median())
+                    if 0.3 < sc < 4.0:
+                        d_v = d_v * sc
+                        scale[v] = sc
+                depth[v] = d_v.clamp(0.0, 60.0).to(torch.float16).float()
+                conf[v] = c_v.clamp(min=0.0).to(torch.float16).float()
 
         torch.save({"depth": depth.to(torch.float16),
                     "conf": conf.to(torch.float16),
-                    "scale": scale}, dst)
+                    "scale": scale,
+                    "sample_identity": geometry_sample_identity(s["meta"]),
+                    "crop_policy": "front2_centered_v1",
+                    "view_layout_version": VIEW_LAYOUT_VERSION,
+                    "perspective_crop_starts": perspective_crop_starts}, dst)
         done += 1
         if done % 64 == 0:
             rate = done / (time.time() - t0)
