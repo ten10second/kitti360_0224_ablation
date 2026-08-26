@@ -261,3 +261,10 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 - **用户裁定**：保留共享联合训练（meas_enc 单实例由两链损失共同训练，不改为随机冻结）；确认实现中每 chunk 的 measurement 恰好计算一次（`prefix`/`recent` 列表在 `_run_chain` 外构建一次，两链闭包消费同一对象；meas_enc 每 chunk 只前向一次）。
 - **experiment_plan 对齐**：§2 训/冻表新增 `GroundMeasurementEncoder`（训、单实例共享）与 XY write head（训、容量对齐）两行；表后写明 shared_assimilation 双链共享 G_t/M_t/updater/readers、G_t 每 chunk 只算一次；§6 分支段改为"不再有独立训练分支，ground_only/one_shot 仅评测期 --control"。
 - **测试裁剪（65→39）**：test_unified_bev.py 48→22——删除退役 frame-completion 路径的全部契约（LatentCompletion/alpha 恒等/coordinate_only completion、卫星 ViT/heightmap prior、nadir 往返、M3D 双 crop、observation RGB 损失、B7 道路系控制、LPIPS/SSIM、frame Stage-A/B checkpoint schema、v6 frame-cache attach 身份）；三个测试缩减为只测存活部分（ColumnFieldDecoder 渲染、fixed_relative_xy_encoding、masked_smooth_l1 空 mask）；保留 world 链活代码契约（几何约定/splat/height_statistics/unproject/GroundDenseBEVEncoder/front2 内参/VGGT 定标四件/chunks/readers 冻结）。裁剪后 39/39 通过。
+
+### 2026-08-27 — E0 冻结 DINOv2 卫星特征探针：信息上限判决（用户问"这个能不能学出来"）
+
+- **设计**：绕开状态机，直接测卫星通路信息上限——冻结 DINOv2-ViT-B/14 对与 `SatelliteInitializer` 完全相同的 200×200 south-up 卫星 raster 抽 16×16 token，小卷积头直接回归 LiDAR height/density（valid 监督）。四臂同头同训练：dino / xy（零特征+固定XY，安慰剂）/ shuffle（逐 scene token 置换，布局绑定性检查）/ scratch（从零小 CNN，可训 encoder 参照）+ 常数基线。训练 22 scene（drives 0000/0005/0009，含 QA gate 跳 2），评测 0003 地理隔离 scene。
+- **结果（held-out 0003）**：dino r=+0.600（train 0.785）≫ xy r=−0.347；shuffle r=+0.441（布局绑定贡献 0.6→0.44 的下降）；scratch r=+0.259（22 scene 下从零 encoder 过拟合，held-out 崩）；hMAE：dino 3.23 < scratch 3.16 ≈ shuffle 3.39 < xy 3.63 < 常数 3.70。**关键分解：全部臂 bias≈+2.5~3.1 m**——eval scene 是下坡路（高度中位 −4.3）而训练 scene 全平地，绝对标定不迁移；bias 校正后 dino MAE 3.39→2.15。视觉复核（e0_vis.png）：预测与真值的道路走廊/建筑 footprint 结构对应，残差以系统性偏置为主。
+- **判决**：①**信息存在**——冻结 DINO 特征携带可跨 scene 迁移的布局信息（r=0.60 且 shuffle/xy 对照干净），E1 有东西可测；②**冻结骨干的选择在当前数据量下是对的**——从零 CNN 显著更差；③**绝对高度标定不可从卫星学**（地形分布依赖），这本来就是状态的分工：Z_0 给布局（低频），updater 的地面测量负责绝对标定（E3）——E1 判读必须看 bias 分解/Pearson，纯 MAE headline 会低估先验价值。density 各臂几乎无分化（0.176–0.201），layout 信号主要在 height。
+- 产物：`scripts/probe_world_satellite_prior.py`、`runs/world_state_e0/{summary.json, e0_vis.png}`；targets_train 22 scene（可复用）。
