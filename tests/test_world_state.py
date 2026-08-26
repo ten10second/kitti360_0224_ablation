@@ -197,3 +197,42 @@ def test_replay_order_changes_metadata():
     s_ba = updater(updater(prev, GroundMeasurement(lat, b_support, b_support.float(), 1)).state,
                    GroundMeasurement(lat, a_support, a_support.float(), 2)).state
     assert not torch.equal(s_ab.last_update, s_ba.last_update)
+
+
+def test_world_height_targets_survive_absolute_elevation():
+    """KITTI-360 world-Z is absolute map altitude (~120 m).  The physical
+    height guard must apply to datum-relative height only; clipping absolute
+    Z first flattened every real surface onto the ceiling and, after datum
+    subtraction, the whole valid tile collapsed to one constant."""
+    import numpy as np
+    from world3d.unified_bev.world_targets import (
+        accumulate_lidar_surface,
+        height_minus_datum,
+    )
+
+    res, size = 0.5, 8
+    road_z, facade_z, datum = 120.0, 128.0, 121.8
+    pts = []
+    for r in range(size):
+        for c in range(4):  # road strip, west half
+            pts.append([c * res + 0.25, r * res + 0.25, road_z])
+    for c in range(4, size):  # facade band on row 4
+        pts.append([c * res + 0.25, 4 * res + 0.25, facade_z])
+    pts.append([5 * res + 0.25, 7 * res + 0.25, 500.0])  # noise far above
+    pts.append([6 * res + 0.25, 7 * res + 0.25, 60.0])   # far below floor
+    packed = accumulate_lidar_surface(
+        np.asarray(pts, dtype=np.float64), np.zeros(2),
+        tile_size_m=size * res, resolution_m=res,
+    )
+    assert abs(packed["height_world_z"][0, 0] - road_z) < 1e-9
+    assert abs(packed["height_world_z"][7, 5] - 500.0) < 1e-9  # no absolute clip
+    h = height_minus_datum(packed["height_world_z"], datum)
+    assert abs(h[0, 0] - (road_z - datum)) < 1e-4   # road ~ -1.8 m
+    assert abs(h[4, 4] - (facade_z - datum)) < 1e-4  # facade ~ +6.2 m
+    assert h[4, 4] > h[0, 0]                        # vertical structure survives
+    assert h[7, 5] == 40.0                          # relative-height ceiling
+    assert h[7, 6] == -2.0                          # relative-height floor
+    valid_h = h[packed["valid"]]
+    assert len(np.unique(valid_h)) > 1              # never collapses to a constant
+    assert not packed["valid"][5, 4]
+    assert h[5, 4] == 0.0                           # unknown cells reset to zero

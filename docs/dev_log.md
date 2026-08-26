@@ -201,3 +201,13 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 ### 2026-08-26 — 实验方案重梳
 
 - `docs/experiment_plan.md` 与当前实现对齐：DINOv2 冻特征 + write head 初始化 \(Z_0\)；VGGT 冻测量；四实验 E1–E4 为全部主验证。
+
+### 2026-08-26 — 修复 world-target 高度的绝对海拔 clip 顺序 bug
+
+- **发现**：`accumulate_lidar_surface` 把物理高度护栏 `np.clip(height, -2, 40)` 作用在**绝对 world-Z p90** 上（KITTI-360 绝对海拔 ~115–125 m），`height_minus_datum` 减 datum 后全图恒等 −85.30 m（0003 smoke blob 实测 std=0、unique=1）——静态 height 监督与 E1–E4 全部 height 指标失义；G_t 测量路径（`state_models.py` 的 `h_rel=z_abs−datum`）本来就正确，因此 updater 会被训练成忽略正确测量。同类 bug 第二次（第一次=08-23 Exp1 的 clamp(30) 压平 DEM）。
+- **修复**：clip 移入 `height_minus_datum`（datum 相对域，−2/40 m，语义对齐 `geometry.relative_height_map`）；`accumulate_lidar_surface` 返回未 clip 的绝对 p90；模块 docstring 写明绝对海拔陷阱。
+- **测试**：新增 `test_world_height_targets_survive_absolute_elevation`（绝对海拔 120/128 m 合成点 + datum 121.8：道路 −1.8、立面 +6.2、500 m 噪声→相对上限 40、60 m→相对下限 −2、"非恒定"断言）；58/58 通过。
+- **重建验证**：0003 同 scene 重建；valid/density/chunk_lidar_support/datum/satellite/origin 全部逐位不变（外科手术式改动），world_target_hash 更新（旧 checkpoint 按设计 fail-fast）。新高度：mode=−1.94 m（≈datum 125.30 − 传感器高 1.8 m 的路面水平）、p50=−0.87、p99=6.75、max=8.78、15257 unique。
+- **可视化验证**：新脚本 `scripts/qa_world_height_targets.py`：卫星图 / 修复前后高度图（同色标）/ 前后直方图（红尖峰 −85 vs 蓝展开）/ 2 m、5 m 等高线叠卫星灰度（与建筑 footprint 含太阳能屋顶对齐）/ 3D 高度表面。图：`runs/world_state_targets_smoke/qa/height_fix_verification.png`。
+- **已知观察（非缺陷）**：37% 有效格落在 −2 m 地板——scene 内地形起伏超过固定 datum 以下 2 m，是 v1 固定 datum 政策（禁逐 chunk quantile）的代价；若影响 E1–E4 可评估把 floor 放宽到 −5 m（设计参数，非正确性问题）。
+- **运维**：sda2 又未挂载，`udisksctl mount -b /dev/sda83` 恢复。

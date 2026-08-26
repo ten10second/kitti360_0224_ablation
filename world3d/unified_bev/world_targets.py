@@ -1,9 +1,15 @@
 """World-defined geometry targets and georeferenced satellite resampling.
 
-Height is ``surface_height_p90_world_z - z_datum_m``.  ``z_datum_m`` is the
-median world-Z of LiDAR optical centers in the scene, not a per-chunk
-quantile.  Cells without LiDAR evidence stay unknown and are never labelled
-free space.
+Height is ``surface_height_p90_world_z - z_datum_m``, then clipped to physical
+relative-height bounds.  ``z_datum_m`` is the median world-Z of LiDAR optical
+centers in the scene, not a per-chunk quantile.  Cells without LiDAR evidence
+stay unknown and are never labelled free space.
+
+KITTI-360 world-Z is an absolute map altitude (~115-125 m).  The physical
+height guard must therefore live in the datum-relative domain
+(``height_minus_datum``), never on absolute Z: clipping absolute Z first
+flattens every real surface to the ceiling (see ``geometry.relative_height_map``
+for the same contract on the frame-centred path).
 """
 from __future__ import annotations
 
@@ -130,13 +136,13 @@ def accumulate_lidar_surface(
     tile_size_m: float,
     resolution_m: float,
     quantile: float = 0.9,
-    min_height_m: float = -2.0,
-    max_height_m: float = 40.0,
 ) -> Dict[str, np.ndarray]:
     """Bin static world points onto the south-up BEV grid.
 
-    Returns height (world Z p90), count, and a valid mask.  Empty cells stay
-    unknown (valid=False) and are not labelled free.
+    Returns height (world Z p90, unclipped absolute altitude), count, and a
+    valid mask.  Empty cells stay unknown (valid=False) and are not labelled
+    free.  Physical height clipping happens only after datum subtraction in
+    ``height_minus_datum``.
     """
     size = int(round(float(tile_size_m) / float(resolution_m)))
     height = np.full((size, size), np.nan, dtype=np.float64)
@@ -164,7 +170,6 @@ def accumulate_lidar_surface(
         count[r, c] = zs.size
         height[r, c] = np.quantile(zs, quantile)
     valid = count > 0
-    height = np.clip(height, min_height_m, max_height_m)
     return {"height_world_z": height, "count": count, "valid": valid}
 
 
@@ -178,10 +183,24 @@ def log_normalize_density(count: np.ndarray) -> np.ndarray:
     return np.clip(density, 0.0, 1.0)
 
 
-def height_minus_datum(height_world_z: np.ndarray, z_datum_m: float) -> np.ndarray:
-    out = np.asarray(height_world_z, dtype=np.float32) - float(z_datum_m)
-    out[~np.isfinite(height_world_z)] = 0.0
-    return out
+def height_minus_datum(
+    height_world_z: np.ndarray,
+    z_datum_m: float,
+    *,
+    min_height_m: float = -2.0,
+    max_height_m: float = 40.0,
+) -> np.ndarray:
+    """Datum-relative height with the physical guard in the relative domain.
+
+    KITTI-360 world-Z is absolute map altitude, so the clip bounds (metres
+    relative to the datum) may only be applied *after* subtraction.  Unknown
+    cells (non-finite) reset to 0.0 and are masked out by ``valid``.
+    """
+    rel = np.asarray(height_world_z, dtype=np.float32) - float(z_datum_m)
+    finite = np.isfinite(height_world_z)
+    rel = np.clip(rel, min_height_m, max_height_m)
+    rel[~finite] = 0.0
+    return rel
 
 
 def query_sparse_depth(
