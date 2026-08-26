@@ -330,6 +330,24 @@ def test_world_vggt_cache_identity_and_assembly():
     assert torch.isfinite(meas.latent).all()
 
 
+def test_supervised_region_excludes_unlabelled_measurement_cells():
+    """VGGT support extends beyond LiDAR labels, and the world target maps are
+    zero (not "unknown") outside world_valid — supervision must intersect the
+    two or unlabelled cells get pushed toward height 0 / density 0."""
+    import torch
+    from world3d.unified_bev.world_state import supervised_region
+
+    support = torch.zeros(1, 1, 4, 4, dtype=torch.bool)
+    support[..., :3, :] = True   # measurement sees 12 cells
+    valid = torch.zeros(1, 1, 4, 4, dtype=torch.bool)
+    valid[..., 2:, :] = True     # labels exist on 8 cells
+    assert int((support & ~valid).sum()) > 0, "fixture must contain unlabelled-but-seen cells"
+    sup = supervised_region(support, valid)
+    assert int((sup & ~valid).sum()) == 0
+    assert int((sup & ~support).sum()) == 0
+    assert int(sup.sum()) == int((support & valid).sum())
+
+
 def test_world_target_version_contract():
     """The version strings must move whenever the target math or datum policy
     changes; a stale checkpoint from v1 must fail validation, not pass."""

@@ -289,3 +289,14 @@ def ahead_mask(future_route_support: Tensor, visited: Tensor) -> Tensor:
 def offroute_mask(world_valid: Tensor, all_ground_supported: Tensor) -> Tensor:
     """Coverage diagnostic only; never a v1 headline region."""
     return world_valid.bool() & ~all_ground_supported.bool()
+
+
+def supervised_region(measurement_support: Tensor, world_valid: Tensor) -> Tensor:
+    """Where a measurement may be supervised against the static world target.
+
+    VGGT support extends well beyond LiDAR coverage, and the target maps are
+    zero (not "unknown") outside ``world_valid``; supervising the raw
+    measurement support would push unlabelled cells toward height 0 / density
+    0 — pseudo-negative labels, not masked supervision.
+    """
+    return measurement_support.bool() & world_valid.bool()

@@ -232,3 +232,11 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 - **真实 smoke（0003，8 chunks）**：缓存 0.6 min（8×64 视图，全 `vehicle_motion` 定标，MAD 0.024–0.114，pose RMSE 0.23–0.67 m，conf>0.3 占 0.61–1.00）；interface 20 步 → assimilation(sat_ground, 真测量) 20 步 loss 12.7→4.6 → eval aligned 9 行 `measurement_source=vggt_cache`；**VGGT support 27,585 格 vs LiDAR chunk mask 11,141 格、Jaccard 0.389**（测量确实来自 VGGT 门控而非监督 mask）；测量-support 语义下 `outside_latent_max=0.0`（精确保持契约在真测量上成立）；teacher fallback 冒烟通过并带显式 WARNING。
 - **顺带修复**：DINOv2 hub 加载优先本地缓存（`source='local'`）——`_parse_repo_info` 在缓存命中前就会探测 GitHub main 分支，断网即挂（本机 repo+权重已在 `~/.cache/torch/hub`）。
 - **测试**：新增 meas_enc 门控（conf/depth 越界 → support 清空、support 外 confidence=0）与缓存身份/组装两测试；63/63 通过。
+
+### 2026-08-26 — P0 修复：VGGT 测量 support 超出 LiDAR 标签的伪负监督
+
+- **核实（外部审查属实）**：assimilation 的 chunk 损失用 `meas.support`（VGGT 门控，chunk1=27,585 格）做 mask，但 `height/density` 在 `world_valid` 外是占位 0（`height_minus_datum`/`log_normalize_density` 构造）——「VGGT 看见、无标签」的格被监督为高度 0/密度 0，是伪负标签而非 masked supervision；eval 的 `g_update`/`forget` 同样用未交 `valid` 的测量 support，指标被 0 值污染。
+- **量化（新诊断字段）**：chunk1 overlap=0.727（7,527 伪负格，27%）、chunk4/8 overlap≈0.84–0.86（约 15%）——修复前 15–27% 的监督区域是伪负标签，此前 20-step loss 12.7→4.6 不能解读为几何学习。
+- **修复**：新增 `world_state.supervised_region(measurement_support, world_valid)`（契约函数+回归测试）；训练 chunk 损失与 one_shot final 损失改用 `supervised = meas.support & valid`；eval `g_update_height`/`forget_1_to_t_height` 改在 `测量support & valid` 上计算，新增行字段 `measurement_support_cells`/`supervised_support_cells`/`measurement_target_overlap`；`outside_latent_max` 保持对完整测量 support（保持契约关心的是写入区域本身）。
+- **同类第三处（自发现）**：`distill = F.smooth_l1_loss(state.latent, z_world)` 是全图无 mask——experiment_plan §6 明确是 "masked distill"；无 mask 版把卫星初始化的 Z_0 在 ahead/未知区域拉向 world teacher 的「未知」外推，直接压制 E1。改为 `masked_smooth_l1(state.latent, z_world, valid)`（valid 经 `_expanded_mask` 广播到 64 通道）。
+- **验证**：64/64 单测；重跑 smoke（interface 复用 → assim 20 步 loss 4.18 → eval aligned）`outside_latent_max=0.0` 不变，overlap 字段落盘。

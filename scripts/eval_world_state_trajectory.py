@@ -210,9 +210,14 @@ def main():
                 if t > 0:
                     prev = snapshots[t - 1]
                     mt = meas_supports[t - 1] if meas_supports else chunk_support[:, t - 1]
-                    row["update_support_cells"] = int(mt.sum())
+                    mt_sup = mt & valid  # pseudo-negative guard: no labels outside valid
+                    row["measurement_support_cells"] = int(mt.sum())
+                    row["supervised_support_cells"] = int(mt_sup.sum())
+                    row["measurement_target_overlap"] = (
+                        float(mt_sup.sum()) / float(mt.sum()) if int(mt.sum()) else 0.0
+                    )
                     row["g_update_height"] = _finite(
-                        _mae(height_r(prev.latent), height, mt) - _mae(h_hat, height, mt)
+                        _mae(height_r(prev.latent), height, mt_sup) - _mae(h_hat, height, mt_sup)
                     )
                     outside = ~mt
                     row["outside_latent_max"] = float(
@@ -221,7 +226,7 @@ def main():
                     if 1 in snapshots and t > 1:
                         m1 = meas_supports[0] if meas_supports else chunk_support[:, 0]
                         row["forget_1_to_t_height"] = _finite(
-                            _mae(h_hat, height, m1) - _mae(height_r(snapshots[1].latent), height, m1)
+                            _mae(h_hat, height, m1 & valid) - _mae(height_r(snapshots[1].latent), height, m1 & valid)
                         )
                 # held-out depth on the current chunk query
                 q = min(max(t - 1, 0), sup.query_depth.shape[1] - 1)

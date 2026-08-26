@@ -8,7 +8,6 @@ import time
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -38,6 +37,7 @@ from world3d.unified_bev.world_state import (  # noqa: E402
     WORLD_STATE_SCHEMA_VERSION,
     GroundMeasurement,
     empty_state,
+    supervised_region,
     visited_mask,
 )
 from world3d.unified_bev.world_vggt import (  # noqa: E402
@@ -146,7 +146,10 @@ def main():
         init_loss = masked_smooth_l1(height_r(state.latent), height, valid) + masked_smooth_l1(
             density_r(state.latent), density, valid,
         )
-        distill = F.smooth_l1_loss(state.latent, z_world)
+        # masked distill per experiment_plan §6: only where the static cloud
+        # actually labels; an unmasked distill would pull the satellite prior
+        # in ahead regions toward the teacher's "unknown" extrapolation
+        distill = masked_smooth_l1(state.latent, z_world, valid)
         loss = init_loss + 0.1 * distill
 
         def _chunk_measurement(t: int, detach_latent: bool) -> GroundMeasurement:
@@ -180,17 +183,21 @@ def main():
             prev = state
             update = updater(state, meas)
             state = update.state
-            vis = visited_mask(chunk_support, t + 1)
-            loss = loss + masked_smooth_l1(height_r(state.latent), height, meas.support)
-            loss = loss + masked_smooth_l1(density_r(state.latent), density, meas.support)
+            # supervise only where BOTH the measurement writes and the static
+            # target labels; VGGT support beyond LiDAR coverage has height=0
+            # placeholders, not ground truth (pseudo-negative labels otherwise)
+            supervised = supervised_region(meas.support, valid)
+            loss = loss + masked_smooth_l1(height_r(state.latent), height, supervised)
+            loss = loss + masked_smooth_l1(density_r(state.latent), density, supervised)
             if t > 0:
                 loss = loss + 0.1 * masked_smooth_l1(
                     height_r(state.latent), height_r(prev.latent).detach(), visited_mask(chunk_support, t),
                 )
         if args.branch == "one_shot" and measurements:
             state = OneShotAssimilator(updater)(state, measurements).state
-            loss = loss + masked_smooth_l1(height_r(state.latent), height, sup.final_support.to(device))
-            loss = loss + masked_smooth_l1(density_r(state.latent), density, sup.final_support.to(device))
+            final = supervised_region(sup.final_support.to(device), valid)
+            loss = loss + masked_smooth_l1(height_r(state.latent), height, final)
+            loss = loss + masked_smooth_l1(density_r(state.latent), density, final)
 
         opt.zero_grad(set_to_none=True)
         if loss.requires_grad:
