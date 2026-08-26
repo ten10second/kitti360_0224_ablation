@@ -34,7 +34,10 @@ from world3d.unified_bev.data import (  # noqa: E402
     UnifiedBEVDataset,
     load_frame_records,
 )
-from world3d.unified_bev.world_vggt import WORLD_VGGT_CACHE_VERSION  # noqa: E402
+from world3d.unified_bev.world_vggt import (  # noqa: E402
+    WORLD_VGGT_CACHE_VERSION,
+    assert_query_isolation,
+)
 
 
 def _view_helper(rigs):
@@ -136,7 +139,21 @@ def main():
             index = int(chunk["chunk_index"])
             if index in {int(k) for k in chunks}:
                 continue
-            fids = list(chunk["geometry_fids"])
+            # strict isolation: the depth-query core frame must not be among
+            # the measurement frames; backfill from the same chunk's unused
+            # frames (arc-nearest first) to keep the VGGT baseline width
+            query_fid = int(chunk["core_fid"])
+            base = [int(f) for f in chunk["geometry_fids"]]
+            member_order = {int(f): i for i, f in enumerate(chunk["fids"])}
+            measurement_fids = [f for f in base if f != query_fid]
+            spare = [f for f in chunk["fids"] if f not in set(base) and f != query_fid]
+            spare.sort(key=lambda f: abs(member_order[f] - member_order[query_fid]))
+            take = min(len(spare), len(base) - len(measurement_fids))
+            measurement_fids = sorted(measurement_fids + spare[:take])
+            assert_query_isolation(
+                {"query_fid": query_fid, "measurement_fids": measurement_fids}, query_fid,
+            )
+            fids = measurement_fids
             rgb, K, T_world_cam, T_world_imu = _chunk_views(helper, recs, fids)
             entry = run_joint_subset(
                 model, rgb, T_world_cam, args.resolution, args.min_baseline_m,
@@ -146,6 +163,8 @@ def main():
             )
             chunks[index] = {
                 "fids": [int(f) for f in fids],
+                "measurement_fids": [int(f) for f in measurement_fids],
+                "query_fid": query_fid,
                 "rgb": rgb.to(torch.float16),
                 "K": K,
                 "T_world_cam": T_world_cam,
@@ -160,7 +179,8 @@ def main():
                 "scale_reliability": entry["scale_reliability"],
             }
             print(
-                f"[world-vggt] {scene_id} chunk={index} frames={len(fids)} views={rgb.shape[0]} "
+                f"[world-vggt] {scene_id} chunk={index} frames={len(fids)} "
+                f"(query {query_fid} excluded) views={rgb.shape[0]} "
                 f"scale={float(entry['metric_scale']):.4f} source={entry['scale_source']} "
                 f"mad={float(entry['scale_relative_mad']):.3f} "
                 f"pose_rmse={float(entry['pose_alignment_rmse_m']):.3f}m "

@@ -17,9 +17,33 @@ import torch
 from .state_models import GroundMeasurementEncoder
 from .world_state import GroundMeasurement
 
-WORLD_VGGT_CACHE_VERSION = "world_vggt_chunk_measurement_v1"
+WORLD_VGGT_CACHE_VERSION = "world_vggt_chunk_measurement_v2"
 
 _ENTRY_RANKS = {"rgb": 5, "K": 4, "depth": 4, "conf": 4, "T_world_cam": 4}
+
+
+def assert_query_isolation(entry: Dict, query_fid: int) -> None:
+    """The depth-query frame must never be among the VGGT measurement frames.
+
+    Without this, ``depth_absrel`` on the query pose is not held-out: the
+    measurement literally saw the frame it is evaluated against.
+    """
+    for key in ("query_fid", "measurement_fids"):
+        if key not in entry:
+            raise RuntimeError(
+                f"cache entry lacks {key}; it predates query isolation — "
+                "rebuild with the v2 cache builder"
+            )
+    if int(entry["query_fid"]) != int(query_fid):
+        raise RuntimeError(
+            f"cache entry query_fid {entry['query_fid']} != blob core fid "
+            f"{query_fid}; chunk identity mismatch"
+        )
+    if int(query_fid) in {int(f) for f in entry["measurement_fids"]}:
+        raise RuntimeError(
+            "query frame leaked into the VGGT measurement frames; "
+            "depth_absrel would not be held-out"
+        )
 
 
 def load_world_vggt_cache(
@@ -63,6 +87,7 @@ def chunk_measurement_from_cache(
     resolution_m: float,
     z_datum_m: torch.Tensor,
     chunk_index: int,
+    query_fid: int,
     detach: bool = False,
 ) -> GroundMeasurement:
     """Turn one cached chunk entry into a GroundMeasurement.
@@ -70,7 +95,11 @@ def chunk_measurement_from_cache(
     ``entry`` tensors are stored half precision; they are cast to float here.
     ``detach`` stops gradients at the measurement latent (used for prefix
     replay); the frozen VGGT side never carries gradients either way.
+    ``query_fid`` is the chunk's depth-query core frame; the entry must be
+    isolated from it (``assert_query_isolation``).
     """
+    assert_query_isolation(entry, query_fid)
+
     def _view(key: str) -> torch.Tensor:
         tensor = entry[key].float().to(device)
         while tensor.ndim < _ENTRY_RANKS[key]:

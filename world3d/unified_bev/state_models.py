@@ -409,6 +409,16 @@ class EvidenceAwareUpdater(nn.Module):
                                 conflict=conflict)
 
 
+def one_shot_support(measurements: Sequence[GroundMeasurement]) -> torch.Tensor:
+    """Union of the supports the one-shot aggregator actually writes.
+
+    The one-shot loss region must match this union (not the accumulated
+    LiDAR support), otherwise it supervises cells the aggregator never
+    wrote and misses cells it did.
+    """
+    return torch.stack([m.support for m in measurements], dim=0).any(dim=0)
+
+
 def aggregate_measurements(measurements: Sequence[GroundMeasurement]) -> GroundMeasurement:
     """Parameter-free union used by the one-shot control."""
     if not measurements:

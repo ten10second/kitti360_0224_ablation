@@ -240,3 +240,9 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 - **修复**：新增 `world_state.supervised_region(measurement_support, world_valid)`（契约函数+回归测试）；训练 chunk 损失与 one_shot final 损失改用 `supervised = meas.support & valid`；eval `g_update_height`/`forget_1_to_t_height` 改在 `测量support & valid` 上计算，新增行字段 `measurement_support_cells`/`supervised_support_cells`/`measurement_target_overlap`；`outside_latent_max` 保持对完整测量 support（保持契约关心的是写入区域本身）。
 - **同类第三处（自发现）**：`distill = F.smooth_l1_loss(state.latent, z_world)` 是全图无 mask——experiment_plan §6 明确是 "masked distill"；无 mask 版把卫星初始化的 Z_0 在 ahead/未知区域拉向 world teacher 的「未知」外推，直接压制 E1。改为 `masked_smooth_l1(state.latent, z_world, valid)`（valid 经 `_expanded_mask` 广播到 64 通道）。
 - **验证**：64/64 单测；重跑 smoke（interface 复用 → assim 20 步 loss 4.18 → eval aligned）`outside_latent_max=0.0` 不变，overlap 字段落盘。
+
+### 2026-08-26 — one-shot mask 语义修正 + VGGT 测量帧/查询帧严格隔离（cache v2）
+
+- **one-shot 遗漏（外部审查指出）**：final 损失区域原用 `sup.final_support`（累计 LiDAR support），与 one-shot 聚合器实际写入区域不一致——会在"LiDAR 有标签、VGGT 没写入"处计算损失、漏掉"VGGT 写入且有效"的格。新增 `state_models.one_shot_support(measurements)`（测量 support 并集）+ `test_one_shot_support_matches_aggregate_write_region`（与 `aggregate_measurements` 写入区域逐位相等）；训练改 `supervised_region(one_shot_support(measurements), valid)`。
+- **查询隔离（此前 depth_absrel 非严格 held-out）**：旧契约 `geometry_fids`（lift+ctx 全成员）含 core 查询帧——实测 0003 smoke **8 chunk 中 3 个（37.5%）query 帧在测量帧内**。v2 修复：构建端剔除 `core_fid`、从同 chunk 未用帧按弧距最近补足（仍 8 帧 64 视图）、entry 存 `measurement_fids`+`query_fid` 并断言 disjoint；加载端 `assert_query_isolation`（缺字段=query 隔离前旧缓存、query_fid 不匹配、泄漏三种 fail-fast）；`WORLD_VGGT_CACHE_VERSION`→`world_vggt_chunk_measurement_v2`；v1 缓存已删除重建。
+- **验证**：65/65 单测（缓存测试扩三断言：身份不匹配/泄漏/旧 schema）；重建 0.6 min 全 vehicle_motion（MAD 0.022–0.114）；链路 smoke（sat_ground 20 步 + one_shot 2 步 + eval aligned）通过，`outside_latent_max=0.0` 保持，`depth_absrel≈0.74–0.81`（严格 held-out 下的 20-step smoke 值，不作效果结论）。

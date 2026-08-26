@@ -297,6 +297,7 @@ def test_world_vggt_cache_identity_and_assembly():
         "K": K, "T_world_cam": T,
         "depth": torch.full((2, size, size), 2.0, dtype=torch.float16),
         "conf": torch.full((2, size, size), 0.9, dtype=torch.float16),
+        "measurement_fids": [101, 102], "query_fid": 99,
     }
     cache = {
         "schema": WORLD_VGGT_CACHE_VERSION, "scene_id": "s0",
@@ -323,11 +324,54 @@ def test_world_vggt_cache_identity_and_assembly():
     with torch.no_grad():
         meas = chunk_measurement_from_cache(
             enc, entry, origin_xy=torch.zeros(1, 2), resolution_m=0.5,
-            z_datum_m=torch.zeros(1, 1), chunk_index=1,
+            z_datum_m=torch.zeros(1, 1), chunk_index=1, query_fid=99,
         )
     assert meas.chunk_index == 1
     assert bool(meas.support.any())
     assert torch.isfinite(meas.latent).all()
+    # query isolation: wrong chunk identity and leaked query frames must fail
+    try:
+        chunk_measurement_from_cache(
+            enc, entry, origin_xy=torch.zeros(1, 2), resolution_m=0.5,
+            z_datum_m=torch.zeros(1, 1), chunk_index=1, query_fid=100,
+        )
+        raise AssertionError("query_fid mismatch must fail")
+    except RuntimeError as exc:
+        assert "query_fid" in str(exc)
+    leaked = dict(entry, measurement_fids=[99, 102])
+    try:
+        chunk_measurement_from_cache(
+            enc, leaked, origin_xy=torch.zeros(1, 2), resolution_m=0.5,
+            z_datum_m=torch.zeros(1, 1), chunk_index=1, query_fid=99,
+        )
+        raise AssertionError("query frame inside measurement frames must fail")
+    except RuntimeError as exc:
+        assert "held-out" in str(exc)
+    stale = {k: v for k, v in entry.items() if k not in ("query_fid", "measurement_fids")}
+    try:
+        chunk_measurement_from_cache(
+            enc, stale, origin_xy=torch.zeros(1, 2), resolution_m=0.5,
+            z_datum_m=torch.zeros(1, 1), chunk_index=1, query_fid=99,
+        )
+        raise AssertionError("v1 entry without isolation fields must fail")
+    except RuntimeError as exc:
+        assert "query isolation" in str(exc)
+
+
+def test_one_shot_support_matches_aggregate_write_region():
+    """The one-shot loss region must equal the union of measurement supports —
+    exactly what aggregate_measurements writes, not the LiDAR final mask."""
+    support_a = torch.zeros(1, 1, 4, 4, dtype=torch.bool)
+    support_a[..., :2, :] = True
+    support_b = torch.zeros(1, 1, 4, 4, dtype=torch.bool)
+    support_b[..., 1:3, :] = True
+    m1 = GroundMeasurement(torch.ones(1, 2, 4, 4), support_a, support_a.float(), 1)
+    m2 = GroundMeasurement(torch.zeros(1, 2, 4, 4), support_b, support_b.float(), 2)
+    from world3d.unified_bev.state_models import aggregate_measurements, one_shot_support
+
+    agg = aggregate_measurements([m1, m2])
+    assert torch.equal(one_shot_support([m1, m2]), agg.support)
+    assert int(one_shot_support([m1, m2]).sum()) == 12  # 4+4 rows minus 2-row overlap
 
 
 def test_supervised_region_excludes_unlabelled_measurement_cells():

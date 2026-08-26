@@ -23,6 +23,7 @@ from world3d.unified_bev.state_models import (  # noqa: E402
     OneShotAssimilator,
     SatelliteInitializer,
     WorldGeometryEncoder,
+    one_shot_support,
 )
 from world3d.unified_bev.world_checkpoints import (  # noqa: E402
     validate_scenes_manifest,
@@ -161,6 +162,7 @@ def main():
                     resolution_m=float(spec.resolution_m),
                     z_datum_m=spec.z_datum_m.to(device),
                     chunk_index=t + 1,
+                    query_fid=int(blob["chunk_table"][t]["core_fid"]),
                     detach=detach_latent,
                 )
             support = chunk_support[:, t]
@@ -195,7 +197,9 @@ def main():
                 )
         if args.branch == "one_shot" and measurements:
             state = OneShotAssimilator(updater)(state, measurements).state
-            final = supervised_region(sup.final_support.to(device), valid)
+            # the loss region must match what the aggregator actually wrote:
+            # the union of the measurement supports, not the LiDAR mask
+            final = supervised_region(one_shot_support(measurements), valid)
             loss = loss + masked_smooth_l1(height_r(state.latent), height, final)
             loss = loss + masked_smooth_l1(density_r(state.latent), density, final)
 

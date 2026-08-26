@@ -162,6 +162,7 @@ def main():
                             resolution_m=float(spec.resolution_m),
                             z_datum_m=spec.z_datum_m,
                             chunk_index=t + 1,
+                            query_fid=int(blob["chunk_table"][t]["core_fid"]),
                             detach=True,
                         )
                     else:
