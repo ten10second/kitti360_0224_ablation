@@ -38,6 +38,14 @@ PY
   --manifest "$TEST_MANIFEST" --split test --lidar_root "$LIDAR_ROOT" \
   --drive "$TEST_DRIVE" --out "$ROOT/targets_test" --max_scenes 1
 
+"${PY[@]}" scripts/build_world_vggt_cache.py \
+  --scenes "$ROOT/targets_train" --manifest "$TRAIN_MANIFEST" \
+  --lidar_root "$LIDAR_ROOT" --out "$ROOT/vggt_cache_train" --device cuda
+
+"${PY[@]}" scripts/build_world_vggt_cache.py \
+  --scenes "$ROOT/targets_test" --manifest "$TEST_MANIFEST" \
+  --lidar_root "$LIDAR_ROOT" --out "$ROOT/vggt_cache_test" --device cuda
+
 "${PY[@]}" scripts/train_world_state_interface.py \
   --scenes "$ROOT/targets_train" --out "$ROOT/interface" \
   --steps "$INTERFACE_STEPS" --device cuda
@@ -45,6 +53,7 @@ PY
 for branch in sat_ground xy_ground ground_only one_shot; do
   "${PY[@]}" scripts/train_world_state_assimilation.py \
     --scenes "$ROOT/targets_train" --interface "$ROOT/interface/world_interface.pt" \
+    --vggt_cache "$ROOT/vggt_cache_train" \
     --out "$ROOT/assim_${branch}" --branch "$branch" --steps "$ASSIM_STEPS" --device cuda
 done
 
@@ -58,6 +67,7 @@ for control in aligned xy random shift_cross sat_only ground_only one_shot world
   "${PY[@]}" scripts/eval_world_state_trajectory.py \
     --scenes "$ROOT/targets_test" --interface "$ROOT/interface/world_interface.pt" \
     --assimilation "$assim" --control "$control" \
+    --vggt_cache "$ROOT/vggt_cache_test" \
     --records_out "$ROOT/eval_${control}.jsonl" --device cuda
 done
 

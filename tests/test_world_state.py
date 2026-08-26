@@ -206,6 +206,8 @@ def test_world_height_targets_survive_absolute_elevation():
     subtraction, the whole valid tile collapsed to one constant."""
     import numpy as np
     from world3d.unified_bev.world_targets import (
+        MAX_RELATIVE_HEIGHT_M,
+        MIN_RELATIVE_HEIGHT_M,
         accumulate_lidar_surface,
         height_minus_datum,
     )
@@ -230,9 +232,196 @@ def test_world_height_targets_survive_absolute_elevation():
     assert abs(h[0, 0] - (road_z - datum)) < 1e-4   # road ~ -1.8 m
     assert abs(h[4, 4] - (facade_z - datum)) < 1e-4  # facade ~ +6.2 m
     assert h[4, 4] > h[0, 0]                        # vertical structure survives
-    assert h[7, 5] == 40.0                          # relative-height ceiling
-    assert h[7, 6] == -2.0                          # relative-height floor
+    assert h[7, 5] == MAX_RELATIVE_HEIGHT_M          # relative-height ceiling
+    assert h[7, 6] == MIN_RELATIVE_HEIGHT_M          # relative-height floor
     valid_h = h[packed["valid"]]
     assert len(np.unique(valid_h)) > 1              # never collapses to a constant
     assert not packed["valid"][5, 4]
     assert h[5, 4] == 0.0                           # unknown cells reset to zero
+
+
+def test_ground_measurement_encoder_support_follows_vggt_gates():
+    """The measurement's support must come from VGGT conf/depth gates on the
+    calibrated unprojection — not from LiDAR supervision masks."""
+    import numpy as np
+    from world3d.unified_bev.state_models import GroundMeasurementEncoder
+
+    size, res = 8, 0.5
+    K = torch.tensor([[8.0, 0, 3.5], [0, 8.0, 3.5], [0, 0, 1.0]])
+    T = torch.eye(4)
+    T[:3, :3] = torch.tensor([[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]])  # look +x
+    images = torch.rand(1, 2, 3, size, size)
+
+    def measure(depth, conf):
+        enc = GroundMeasurementEncoder(latent_channels=8, bev_height=size, bev_width=size)
+        with torch.no_grad():
+            return enc(
+                images=images, K=K.expand(1, 2, 3, 3), dense_depth=depth, dense_conf=conf,
+                T_world_cam=T.expand(1, 2, 4, 4), origin_xy=torch.zeros(1, 2),
+                resolution_m=res, z_datum_m=torch.zeros(1, 1), chunk_index=3,
+            )
+
+    good = measure(torch.full((1, 2, size, size), 2.0), torch.full((1, 2, size, size), 0.9))
+    assert good.chunk_index == 3
+    assert bool(good.support.any()), "gated depth/conf must produce support"
+    assert float(good.confidence[~good.support].abs().max()) == 0.0
+    assert torch.isfinite(good.latent).all()
+
+    oob = measure(torch.full((1, 2, size, size), 100.0), torch.full((1, 2, size, size), 0.9))
+    assert not bool(oob.support.any()), "depth beyond the gate bound must empty the support"
+    lowconf = measure(torch.full((1, 2, size, size), 2.0), torch.full((1, 2, size, size), 0.1))
+    assert not bool(lowconf.support.any()), "confidence below the gate must empty the support"
+
+
+def test_world_vggt_cache_identity_and_assembly():
+    """The per-scene VGGT cache is bound to the target contract; stale or
+    mismatched caches must fail fast, and valid entries must assemble into a
+    GroundMeasurement without re-running VGGT."""
+    import tempfile
+
+    import torch
+
+    from world3d.unified_bev.state_models import GroundMeasurementEncoder
+    from world3d.unified_bev.world_vggt import (
+        WORLD_VGGT_CACHE_VERSION,
+        chunk_measurement_from_cache,
+        load_world_vggt_cache,
+    )
+
+    size = 8
+    K = torch.tensor([[8.0, 0, 3.5], [0, 8.0, 3.5], [0, 0, 1.0]]).expand(2, 3, 3)
+    T = torch.eye(4).expand(2, 4, 4).clone()
+    T[:, :3, :3] = torch.tensor([[0.0, 0.0, 1.0], [0.0, 1.0, 0.0], [-1.0, 0.0, 0.0]])
+    entry = {
+        "rgb": torch.rand(2, 3, size, size).to(torch.float16),
+        "K": K, "T_world_cam": T,
+        "depth": torch.full((2, size, size), 2.0, dtype=torch.float16),
+        "conf": torch.full((2, size, size), 0.9, dtype=torch.float16),
+    }
+    cache = {
+        "schema": WORLD_VGGT_CACHE_VERSION, "scene_id": "s0",
+        "world_target_version": "v2", "world_target_hash": "hash0",
+        "chunks": {"1": entry},
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        torch.save(cache, f"{tmp}/s0.pt")
+        loaded = load_world_vggt_cache(tmp, "s0", "v2", "hash0")
+        assert "1" in loaded["chunks"]
+        try:
+            load_world_vggt_cache(tmp, "s0", "v2", "different")
+            raise AssertionError("hash mismatch must fail")
+        except RuntimeError as exc:
+            assert "world_target_hash" in str(exc)
+        cache["schema"] = "legacy"
+        torch.save(cache, f"{tmp}/s0.pt")
+        try:
+            load_world_vggt_cache(tmp, "s0", "v2", "hash0")
+            raise AssertionError("schema mismatch must fail")
+        except RuntimeError:
+            pass
+    enc = GroundMeasurementEncoder(latent_channels=8, bev_height=size, bev_width=size)
+    with torch.no_grad():
+        meas = chunk_measurement_from_cache(
+            enc, entry, origin_xy=torch.zeros(1, 2), resolution_m=0.5,
+            z_datum_m=torch.zeros(1, 1), chunk_index=1,
+        )
+    assert meas.chunk_index == 1
+    assert bool(meas.support.any())
+    assert torch.isfinite(meas.latent).all()
+
+
+def test_world_target_version_contract():
+    """The version strings must move whenever the target math or datum policy
+    changes; a stale checkpoint from v1 must fail validation, not pass."""
+    from world3d.unified_bev.world_state import WORLD_TARGET_VERSION, Z_DATUM_POLICY
+    assert WORLD_TARGET_VERSION == "surface_p90_relative_height_clipped_v2"
+    assert Z_DATUM_POLICY == "first_chunk_lidar_optical_center_world_z_median_v1"
+
+
+def test_first_chunk_datum_is_causal():
+    """The scene datum may only read the FIRST chunk's optical centers; a
+    scene-wide median would consume future vehicle positions at t=0."""
+    from types import SimpleNamespace
+
+    import numpy as np
+    from world3d.unified_bev.world_targets import first_chunk_datum_z
+
+    def rec(z):
+        T = np.eye(4)
+        T[2, 3] = z
+        return SimpleNamespace(T_world_cam=T, _T_cam_velo=np.eye(4))
+
+    by_fid = {f"a{i}": rec(z) for i, z in enumerate([121.7, 121.8, 121.9])}
+    by_fid.update({f"b{i}": rec(z) for i, z in enumerate([200.0, 205.0])})  # future
+    window = [
+        SimpleNamespace(fids=("a0", "a1", "a2")),
+        SimpleNamespace(fids=("b0", "b1")),
+    ]
+    assert abs(first_chunk_datum_z(window, by_fid) - 121.8) < 1e-9
+
+
+def test_scene_dataset_binds_target_version_and_manifest():
+    import json
+    import tempfile
+
+    import torch
+
+    from world3d.unified_bev.world_checkpoints import (
+        compute_world_interface_fingerprint,
+        validate_scenes_manifest,
+    )
+    from world3d.unified_bev.world_data import WorldStateSceneDataset
+    from world3d.unified_bev.world_state import (
+        WORLD_STATE_SCHEMA_VERSION,
+        WORLD_TARGET_VERSION,
+        Z_DATUM_POLICY,
+    )
+
+    def make_blob(version, target_hash):
+        return {
+            "tile_size_m": 8.0, "resolution_m": 0.5, "chunking_version": "route_chunk_v1",
+            "world_target_version": version, "world_target_hash": target_hash,
+        }
+
+    with tempfile.TemporaryDirectory() as tmp:
+        torch.save(make_blob("surface_p90_world_z_minus_lidar_origin_median_v1", "h1"),
+                   f"{tmp}/old.pt")
+        torch.save(make_blob(WORLD_TARGET_VERSION, "h2"), f"{tmp}/new.pt")
+        with open(f"{tmp}/scenes.jsonl", "w") as f:
+            f.write(json.dumps({"scene_id": "old", "split": "train", "file": "old.pt",
+                                "world_target_hash": "h1"}) + "\n")
+        try:
+            WorldStateSceneDataset(tmp)
+            raise AssertionError("stale-version blob must be rejected")
+        except RuntimeError as exc:
+            assert "world_target_version" in str(exc)
+
+        with open(f"{tmp}/scenes.jsonl", "w") as f:
+            f.write(json.dumps({"scene_id": "new", "split": "train", "file": "new.pt",
+                                "world_target_hash": "h2"}) + "\n")
+            f.write(json.dumps({"scene_id": "newer", "split": "train", "file": "new.pt",
+                                "world_target_hash": "h9"}) + "\n")
+        ds = WorldStateSceneDataset(tmp)
+        assert ds.manifest_hash == WorldStateSceneDataset(tmp).manifest_hash  # deterministic
+
+        def ck(manifest):
+            return {
+                "schema_version": WORLD_STATE_SCHEMA_VERSION,
+                "world_target_version": WORLD_TARGET_VERSION,
+                "z_datum_policy": Z_DATUM_POLICY,
+                "scenes_manifest_hash": manifest,
+                "encoder": {"w": torch.zeros(1)},
+                "height_reader": {"w": torch.zeros(1)},
+                "density_reader": {"w": torch.zeros(1)},
+                "depth_reader": {"w": torch.zeros(1)},
+            }
+
+        assert (compute_world_interface_fingerprint(ck(ds.manifest_hash))
+                != compute_world_interface_fingerprint(ck("other")))
+        validate_scenes_manifest(ck(ds.manifest_hash), ds.manifest_hash)
+        validate_scenes_manifest({"no_binding": True}, ds.manifest_hash)
+        try:
+            validate_scenes_manifest(ck(ds.manifest_hash), "different")
+            raise AssertionError("manifest mismatch must fail")
+        except RuntimeError:
+            pass

@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Tuple
 
 import numpy as np
 import torch
@@ -25,7 +26,28 @@ from world3d.unified_bev.world_data import (  # noqa: E402
     build_scene_blob,
     propose_scenes,
 )
-from world3d.unified_bev.world_targets import satellite_mapping_error_px  # noqa: E402
+from world3d.unified_bev.world_targets import (  # noqa: E402
+    MAX_RELATIVE_HEIGHT_M,
+    MIN_RELATIVE_HEIGHT_M,
+    satellite_mapping_error_px,
+)
+
+# QA gate: with the causal first-chunk datum, genuine terrain should stay
+# inside the physical bounds; mass at a bound means flattened relief, which
+# Stage A would then learn as constant.
+FLOOR_FRAC_MAX = 0.02
+CEIL_FRAC_MAX = 0.01
+
+
+def _bound_fractions(blob: dict) -> Tuple[float, float]:
+    height = blob["height"].float()
+    valid = blob["world_valid"].bool()
+    hv = height[valid]
+    if hv.numel() == 0:
+        return 1.0, 1.0
+    floor = float((hv <= MIN_RELATIVE_HEIGHT_M + 1e-3).float().mean())
+    ceil = float((hv >= MAX_RELATIVE_HEIGHT_M - 1e-3).float().mean())
+    return floor, ceil
 
 
 def _view_helper(image_size=(160, 96)):
@@ -117,6 +139,12 @@ def main():
                 skipped += 1
                 print(f"[skip] mapping error {float(err.max()):.3e} px")
                 continue
+            floor_frac, ceil_frac = _bound_fractions(blob)
+            if floor_frac > FLOOR_FRAC_MAX or ceil_frac > CEIL_FRAC_MAX:
+                skipped += 1
+                print(f"[skip] bound gate floor_frac={floor_frac:.3f} ceil_frac={ceil_frac:.3f} "
+                      f"(max {FLOOR_FRAC_MAX}/{CEIL_FRAC_MAX})")
+                continue
             fname = f"{blob['scene_id']}.pt"
             torch.save(blob, out / fname)
             _save_qa(blob, qa_dir / f"{blob['scene_id']}.png")
@@ -134,7 +162,8 @@ def main():
             })
             built += 1
             print(f"[scene] {blob['scene_id']} chunks={len(blob['chunk_table'])} "
-                  f"valid={int(blob['world_valid'].sum())} datum={float(blob['z_datum_m']):.2f}")
+                  f"valid={int(blob['world_valid'].sum())} datum={float(blob['z_datum_m']):.2f} "
+                  f"floor_frac={floor_frac:.4f} ceil_frac={ceil_frac:.4f}")
             if built >= args.max_scenes:
                 break
         if built >= args.max_scenes:

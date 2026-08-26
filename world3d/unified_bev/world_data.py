@@ -30,11 +30,10 @@ from .world_state import (
 )
 from .world_targets import (
     accumulate_lidar_surface,
+    first_chunk_datum_z,
     georeferenced_satellite_resample,
     height_minus_datum,
-    lidar_optical_center_world,
     log_normalize_density,
-    z_datum_from_centers,
 )
 
 
@@ -162,19 +161,19 @@ def build_scene_blob(
     origin = proposal["origin_xy"]
     sat_center = proposal["sat_center_xy"]
     anchor = proposal["anchor"]
-    centers_z = []
+    # Causal datum: FIRST chunk's LiDAR optical centers only; the whole-scene
+    # median used future vehicle positions at t=0.
+    z_datum = first_chunk_datum_z(window, by_fid)
     all_points = []
     chunk_points: List[np.ndarray] = []
     for c in window:
         pts_c = []
         for fid in c.fids:
             rec = by_fid[fid]
-            centers_z.append(float(lidar_optical_center_world(rec.T_world_cam, rec._T_cam_velo)[2]))
             pts = _points_world(rec)
             pts_c.append(pts)
             all_points.append(pts)
         chunk_points.append(np.concatenate(pts_c, axis=0) if pts_c else np.zeros((0, 3)))
-    z_datum = z_datum_from_centers(centers_z)
     packed = accumulate_lidar_surface(
         np.concatenate(all_points, axis=0) if all_points else np.zeros((0, 3)),
         origin, tile_size_m=tile_size_m, resolution_m=resolution_m,
@@ -286,7 +285,13 @@ def build_scene_blob(
 
 
 class WorldStateSceneDataset(Dataset):
-    """Loads prebuilt scene blobs.  ``__getitem__`` returns (ModelInputs, SupervisionBundle)."""
+    """Loads prebuilt scene blobs.  ``__getitem__`` returns (ModelInputs, SupervisionBundle).
+
+    Fails fast on any blob whose ``world_target_version`` differs from the
+    code contract, and exposes ``manifest_hash`` (sha256 over scene_id +
+    world_target_hash of every row) so Stage-A checkpoints can bind the exact
+    target set they were fitted on.
+    """
 
     def __init__(self, root: str, split: Optional[str] = None):
         self.root = Path(root)
@@ -297,17 +302,41 @@ class WorldStateSceneDataset(Dataset):
         self.rows = rows
         if not self.rows:
             raise RuntimeError(f"no world-state scenes in {manifest_path} split={split!r}")
+        try:
+            manifest = sorted(
+                (f"{r['scene_id']}|{r['world_target_hash']}" for r in self.rows),
+            )
+        except KeyError as exc:
+            raise RuntimeError(
+                f"{manifest_path} rows lack {exc}; rebuild targets with the "
+                "current build script"
+            ) from None
+        digest = hashlib.sha256()
+        for entry in manifest:
+            digest.update(entry.encode("utf-8"))
+        self.manifest_hash = digest.hexdigest()
         first = torch.load(self.root / self.rows[0]["file"], map_location="cpu", weights_only=False)
+        self._check_target_version(first, self.rows[0]["file"])
         self.tile_size_m = float(first["tile_size_m"])
         self.resolution_m = float(first["resolution_m"])
         self.bev_size = int(round(self.tile_size_m / self.resolution_m))
         self.chunking_version = str(first["chunking_version"])
+
+    @staticmethod
+    def _check_target_version(blob: dict, name: str) -> None:
+        got = blob.get("world_target_version")
+        if got != WORLD_TARGET_VERSION:
+            raise RuntimeError(
+                f"scene blob {name} has world_target_version {got!r}; this code "
+                f"expects {WORLD_TARGET_VERSION!r} — rebuild the targets"
+            )
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, idx: int) -> Tuple[ModelInputs, SupervisionBundle, dict]:
         blob = torch.load(self.root / self.rows[idx]["file"], map_location="cpu", weights_only=False)
+        self._check_target_version(blob, self.rows[idx]["file"])
         sat = blob["satellite_bev"]
         if sat.ndim == 3:
             sat = sat.unsqueeze(0)

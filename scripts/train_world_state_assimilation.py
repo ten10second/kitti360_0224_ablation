@@ -26,6 +26,7 @@ from world3d.unified_bev.state_models import (  # noqa: E402
     WorldGeometryEncoder,
 )
 from world3d.unified_bev.world_checkpoints import (  # noqa: E402
+    validate_scenes_manifest,
     validate_world_interface_checkpoint,
 )
 from world3d.unified_bev.world_data import (  # noqa: E402
@@ -38,6 +39,11 @@ from world3d.unified_bev.world_state import (  # noqa: E402
     GroundMeasurement,
     empty_state,
     visited_mask,
+)
+from world3d.unified_bev.world_vggt import (  # noqa: E402
+    chunk_measurement_from_cache,
+    load_world_vggt_cache,
+    teacher_measurement,
 )
 from world3d.unified_bev.models import ColumnFieldDecoder  # noqa: E402
 
@@ -60,6 +66,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenes", required=True)
     ap.add_argument("--interface", required=True)
+    ap.add_argument("--vggt_cache", default=None,
+                    help="per-scene frozen-VGGT measurement cache (the real "
+                         "measurement path); without it the LiDAR teacher "
+                         "fallback is used and the run is diagnostic only")
     ap.add_argument("--out", default="runs/world_state_assimilation")
     ap.add_argument("--branch", choices=["sat_ground", "ground_only", "xy_ground", "one_shot"],
                     default="sat_ground")
@@ -77,6 +87,13 @@ def main():
     ds = WorldStateSceneDataset(args.scenes)
     loader = DataLoader(ds, batch_size=1, shuffle=True, collate_fn=collate_world_state, num_workers=0)
     ck, fp, world_enc, height_r, density_r, depth_r = _load_interface(args.interface, device)
+    validate_scenes_manifest(ck, ds.manifest_hash)
+    vggt_caches: dict = {}
+    if args.vggt_cache is None:
+        print("[world-b] WARNING: no --vggt_cache; using the LiDAR teacher "
+              "measurement fallback (diagnostic only, E3 does not hold)")
+    else:
+        print(f"[world-b] measurement source: frozen-VGGT cache {args.vggt_cache}")
     frozen_ids = {id(p) for m in (world_enc, height_r, density_r, depth_r) for p in m.parameters()}
 
     bev = ds.bev_size
@@ -110,6 +127,12 @@ def main():
         valid = sup.world_valid.to(device)
         chunk_support = sup.chunk_lidar_support.to(device)
         t_chunks = chunk_support.shape[1]
+        scene_id = blob["scene_id"]
+        if args.vggt_cache is not None and scene_id not in vggt_caches:
+            vggt_caches[scene_id] = load_world_vggt_cache(
+                args.vggt_cache, scene_id,
+                str(blob["world_target_version"]), str(blob["world_target_hash"]),
+            )
         with torch.no_grad():
             z_world = world_enc(height, density, valid)
 
@@ -127,14 +150,19 @@ def main():
         loss = init_loss + 0.1 * distill
 
         def _chunk_measurement(t: int, detach_latent: bool) -> GroundMeasurement:
+            if args.vggt_cache is not None:
+                return chunk_measurement_from_cache(
+                    meas_enc,
+                    vggt_caches[scene_id]["chunks"][str(t + 1)],
+                    origin_xy=inputs.origin_xy.to(device),
+                    resolution_m=float(spec.resolution_m),
+                    z_datum_m=spec.z_datum_m.to(device),
+                    chunk_index=t + 1,
+                    detach=detach_latent,
+                )
             support = chunk_support[:, t]
             latent = world_enc(height * support, density * support, support)
-            if detach_latent:
-                latent = latent.detach()
-            return GroundMeasurement(
-                latent=latent, support=support,
-                confidence=support.float() * 0.8, chunk_index=t + 1,
-            )
+            return teacher_measurement(latent, support, t + 1)
 
         measurements = []
         n_back = min(args.unroll, t_chunks)
@@ -143,7 +171,9 @@ def main():
             with torch.no_grad():
                 state = updater(state, _chunk_measurement(t, True)).state
         for t in range(start, t_chunks):
-            meas = _chunk_measurement(t, True)
+            # recent steps keep measurement gradients so GroundMeasurementEncoder
+            # trains through the updater loss; prefix replay detaches
+            meas = _chunk_measurement(t, False)
             measurements.append(meas)
             if args.branch == "one_shot":
                 continue
@@ -180,6 +210,7 @@ def main():
                 "updater": updater.state_dict(),
                 "measurement_encoder": meas_enc.state_dict(),
                 "branch": args.branch,
+                "measurement_source": "vggt_cache" if args.vggt_cache else "lidar_teacher_fallback",
                 "step": step,
                 "config": vars(args),
             }, out / "assimilation.pt")

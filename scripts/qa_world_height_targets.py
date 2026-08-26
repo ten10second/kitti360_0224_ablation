@@ -19,6 +19,11 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from world3d.unified_bev.world_targets import (  # noqa: E402
+    MAX_RELATIVE_HEIGHT_M,
+    MIN_RELATIVE_HEIGHT_M,
+)
+
 
 def _height_panel(ax, blob, vmin, vmax, title):
     import torch
@@ -77,7 +82,8 @@ def main():
     ax_hist.hist(hv, bins=bins, alpha=0.6, label=f"after (uniq={len(np.unique(hv))})", color="tab:blue")
     ax_hist.set_yscale("log")
     ax_hist.set_xlabel("height rel. datum [m]")
-    ax_hist.axvline(-2.0, color="k", ls=":", lw=1, label="clip floor -2 m")
+    ax_hist.axvline(MIN_RELATIVE_HEIGHT_M, color="k", ls=":", lw=1,
+                    label=f"clip floor {MIN_RELATIVE_HEIGHT_M:g} m")
     ax_hist.legend(fontsize=8)
     ax_hist.set_title("height histogram, valid cells")
 
@@ -115,7 +121,8 @@ def main():
     print(f"[qa] datum={datum:.2f} valid={int(v.sum())} "
           f"min={hv.min():.2f} mode={_mode(hv):.2f} p50={np.median(hv):.2f} "
           f"p99={np.percentile(hv, 99):.2f} max={hv.max():.2f} "
-          f"floor_frac={float((hv <= -1.999).mean()):.3f} ceil_frac={float((hv >= 39.999).mean()):.3f}")
+          f"floor_frac={float((hv <= MIN_RELATIVE_HEIGHT_M + 1e-3).mean()):.3f} "
+          f"ceil_frac={float((hv >= MAX_RELATIVE_HEIGHT_M - 1e-3).mean()):.3f}")
 
 
 def _mode(values: np.ndarray) -> float:

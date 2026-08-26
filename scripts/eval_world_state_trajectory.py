@@ -20,6 +20,7 @@ from world3d.unified_bev.state_models import (  # noqa: E402
     BEVWorldHeightDecoder,
     EvidenceAwareUpdater,
     FixedXYInitializer,
+    GroundMeasurementEncoder,
     OneShotAssimilator,
     SatelliteInitializer,
     WorldGeometryEncoder,
@@ -34,11 +35,15 @@ from world3d.unified_bev.world_data import (  # noqa: E402
     spec_from_inputs,
 )
 from world3d.unified_bev.world_state import (  # noqa: E402
-    GroundMeasurement,
     ahead_mask,
     empty_state,
     offroute_mask,
     visited_mask,
+)
+from world3d.unified_bev.world_vggt import (  # noqa: E402
+    chunk_measurement_from_cache,
+    load_world_vggt_cache,
+    teacher_measurement,
 )
 
 
@@ -68,6 +73,9 @@ def main():
     ap.add_argument("--scenes", required=True)
     ap.add_argument("--interface", required=True)
     ap.add_argument("--assimilation", required=True)
+    ap.add_argument("--vggt_cache", default=None,
+                    help="frozen-VGGT measurement cache matching the scenes; "
+                         "without it the LiDAR teacher fallback is evaluated")
     ap.add_argument("--control", choices=["aligned", "xy", "random", "shift_cross", "shift_road",
                                           "sat_only", "ground_only", "one_shot", "world_upper"],
                     default="aligned")
@@ -99,8 +107,14 @@ def main():
     sat_init.load_state_dict(b["satellite_initializer"])
     xy_init.load_state_dict(b["xy_initializer"])
     updater.load_state_dict(b["updater"])
-    for m in (world_enc, height_r, density_r, depth_r, sat_init, xy_init, updater):
+    meas_enc = GroundMeasurementEncoder(bev_height=bev, bev_width=bev).to(device)
+    meas_enc.load_state_dict(b["measurement_encoder"])
+    for m in (world_enc, height_r, density_r, depth_r, sat_init, xy_init, updater, meas_enc):
         freeze_module(m)
+    vggt_caches: dict = {}
+    if args.vggt_cache is None:
+        print("[world-eval] WARNING: no --vggt_cache; trajectories use the "
+              "LiDAR teacher measurement fallback (diagnostic only)")
 
     rows = []
     with torch.no_grad():
@@ -129,15 +143,33 @@ def main():
                 state = sat_init(sat, spec)
 
             t_chunks = chunk_support.shape[1]
-            snapshots = {0: state}
-            if args.control not in ("sat_only", "world_upper"):
-                meas_list = []
-                for t in range(t_chunks):
-                    support = chunk_support[:, t]
-                    meas = GroundMeasurement(
-                        latent=world_enc(height * support, density * support, support),
-                        support=support, confidence=support.float() * 0.8, chunk_index=t + 1,
+            if args.vggt_cache is not None:
+                scene_id = blob["scene_id"]
+                if scene_id not in vggt_caches:
+                    vggt_caches[scene_id] = load_world_vggt_cache(
+                        args.vggt_cache, scene_id,
+                        str(blob["world_target_version"]), str(blob["world_target_hash"]),
                     )
+            snapshots = {0: state}
+            meas_list = []
+            if args.control not in ("sat_only", "world_upper"):
+                for t in range(t_chunks):
+                    if args.vggt_cache is not None:
+                        meas = chunk_measurement_from_cache(
+                            meas_enc,
+                            vggt_caches[scene_id]["chunks"][str(t + 1)],
+                            origin_xy=spec.origin_xy,
+                            resolution_m=float(spec.resolution_m),
+                            z_datum_m=spec.z_datum_m,
+                            chunk_index=t + 1,
+                            detach=True,
+                        )
+                    else:
+                        support = chunk_support[:, t]
+                        meas = teacher_measurement(
+                            world_enc(height * support, density * support, support),
+                            support, t + 1,
+                        )
                     meas_list.append(meas)
                 if args.control == "one_shot":
                     snapshots[t_chunks] = OneShotAssimilator(updater)(state, meas_list).state
@@ -147,6 +179,10 @@ def main():
                     for t, meas in enumerate(meas_list, start=1):
                         state = updater(state, meas).state
                         snapshots[t] = state
+            # E3/E4 regions are the measurement supports (what the updater
+            # actually writes); with VGGT measurements these extend beyond the
+            # LiDAR chunk mask, so preservation is checked against them
+            meas_supports = [m.support for m in meas_list]
 
             all_ground = chunk_support.any(dim=1)
             for t, st in snapshots.items():
@@ -158,6 +194,7 @@ def main():
                 row = {
                     "scene_id": blob["scene_id"],
                     "control": args.control,
+                    "measurement_source": "vggt_cache" if args.vggt_cache else "lidar_teacher_fallback",
                     "version": int(t),
                     "traversed_m": float(sup.traversed_m[0, t - 1]) if t > 0 else 0.0,
                     "visited_fraction": float(vis.float().mean()),
@@ -172,7 +209,8 @@ def main():
                 }
                 if t > 0:
                     prev = snapshots[t - 1]
-                    mt = chunk_support[:, t - 1]
+                    mt = meas_supports[t - 1] if meas_supports else chunk_support[:, t - 1]
+                    row["update_support_cells"] = int(mt.sum())
                     row["g_update_height"] = _finite(
                         _mae(height_r(prev.latent), height, mt) - _mae(h_hat, height, mt)
                     )
@@ -181,7 +219,7 @@ def main():
                         (st.latent - prev.latent).abs().masked_select(outside.expand_as(st.latent)).max().item()
                     ) if outside.any() else 0.0
                     if 1 in snapshots and t > 1:
-                        m1 = chunk_support[:, 0]
+                        m1 = meas_supports[0] if meas_supports else chunk_support[:, 0]
                         row["forget_1_to_t_height"] = _finite(
                             _mae(h_hat, height, m1) - _mae(height_r(snapshots[1].latent), height, m1)
                         )

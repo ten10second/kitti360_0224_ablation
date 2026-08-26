@@ -7,6 +7,7 @@ historical images.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -96,7 +97,15 @@ class FrozenDINOv2(nn.Module):
 
     def __init__(self, name: str = "dinov2_vitb14"):
         super().__init__()
-        self.model = torch.hub.load("facebookresearch/dinov2", name, pretrained=True)
+        # Prefer the local hub cache (repo zip + pretrain weights) so nothing
+        # phones home; fall back to GitHub on a machine without a cache.
+        repo_dir = Path(torch.hub.get_dir()) / "facebookresearch_dinov2_main"
+        if repo_dir.is_dir():
+            self.model = torch.hub.load(str(repo_dir), name, source="local", pretrained=True)
+        else:
+            self.model = torch.hub.load(
+                "facebookresearch/dinov2", name, pretrained=True, skip_validation=True,
+            )
         for parameter in self.model.parameters():
             parameter.requires_grad_(False)
         self.model.eval()

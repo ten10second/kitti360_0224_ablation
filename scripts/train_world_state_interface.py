@@ -109,6 +109,7 @@ def main():
                 "schema_version": WORLD_STATE_SCHEMA_VERSION,
                 "world_target_version": WORLD_TARGET_VERSION,
                 "z_datum_policy": Z_DATUM_POLICY,
+                "scenes_manifest_hash": ds.manifest_hash,
                 "encoder": encoder.state_dict(),
                 "height_reader": height_reader.state_dict(),
                 "density_reader": density_reader.state_dict(),

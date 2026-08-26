@@ -17,6 +17,7 @@ def compute_world_interface_fingerprint(checkpoint: Mapping[str, object]) -> str
         key: checkpoint[key]
         for key in (
             "schema_version", "world_target_version", "z_datum_policy",
+            "scenes_manifest_hash",
             "encoder_config", "height_reader_config", "density_reader_config",
             "depth_reader_config", "grid_config", "chunk_config",
             "provenance_enum",
@@ -46,6 +47,21 @@ def validate_world_interface_checkpoint(checkpoint: Mapping[str, object]) -> str
     if checkpoint.get("fingerprint") != computed:
         raise RuntimeError("world-interface fingerprint mismatch")
     return computed
+
+
+def validate_scenes_manifest(checkpoint: Mapping[str, object], manifest_hash: str) -> None:
+    """Bind a checkpoint to the exact scene set it was fitted on.
+
+    Only for code paths that reload the SAME scenes the interface was trained
+    on (e.g. assimilation training).  Held-out evaluation scenes deliberately
+    use a different manifest and must not call this.
+    """
+    bound = checkpoint.get("scenes_manifest_hash")
+    if bound is not None and bound != manifest_hash:
+        raise RuntimeError(
+            "scene manifest mismatch: interface was fitted on a different "
+            "target set — rebuild targets or retrain the interface"
+        )
 
 
 def validate_assimilation_checkpoint(checkpoint: Mapping[str, object], interface_fp: str) -> None:

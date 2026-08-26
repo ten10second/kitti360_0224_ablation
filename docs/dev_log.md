@@ -211,3 +211,24 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 - **可视化验证**：新脚本 `scripts/qa_world_height_targets.py`：卫星图 / 修复前后高度图（同色标）/ 前后直方图（红尖峰 −85 vs 蓝展开）/ 2 m、5 m 等高线叠卫星灰度（与建筑 footprint 含太阳能屋顶对齐）/ 3D 高度表面。图：`runs/world_state_targets_smoke/qa/height_fix_verification.png`。
 - **已知观察（非缺陷）**：37% 有效格落在 −2 m 地板——scene 内地形起伏超过固定 datum 以下 2 m，是 v1 固定 datum 政策（禁逐 chunk quantile）的代价；若影响 E1–E4 可评估把 floor 放宽到 −5 m（设计参数，非正确性问题）。
 - **运维**：sda2 又未挂载，`udisksctl mount -b /dev/sda83` 恢复。
+
+### 2026-08-26 — world_target_v2：版本契约 + 因果 datum + 地板放宽（外部审查三点）
+
+- **核实（三点全部属实）**：①`WORLD_TARGET_VERSION` 未随 clip 修复 bump，且 interface fingerprint 只含字符串常量、不含 scene 的 `world_target_hash`——buggy-math 时代的 checkpoint 仍能通过验证；`WorldStateSceneDataset` 也不检查 blob 的 `world_target_version`。②−2 m floor 在真实 0003 上压掉 37% 有效格。③datum 用整段轨迹光心中位数，t=0 时读取未来车辆位置（非因果）。
+- **v2 契约**：`WORLD_TARGET_VERSION="surface_p90_relative_height_clipped_v2"`、`Z_DATUM_POLICY="first_chunk_lidar_optical_center_world_z_median_v1"`；`MIN/MAX_RELATIVE_HEIGHT_M=-8/40` 提为 `world_targets` 模块常量。
+- **因果 datum**：新增 `first_chunk_datum_z(window, by_fid)`（仅第一个 chunk 的 LiDAR 光心 world-Z 中位数，建图开始即可得，全 scene 固定）；`build_scene_blob` 弃用全场中位数。
+- **版本/manifest 绑定**：`WorldStateSceneDataset` 在 `__init__`/`__getitem__` fail-fast 校验每个 blob 的 `world_target_version`，并暴露 `manifest_hash`（scene_id+world_target_hash 排序 sha256）；Stage A checkpoint 保存 `scenes_manifest_hash` 且计入 interface fingerprint；assimilation 训练前 `validate_scenes_manifest`（eval 用 held-out scenes 不做 manifest 等值校验，只走版本契约）。
+- **QA gate**：build 期 `floor_frac ≤ 2%`、`ceil_frac ≤ 1%`，超限 skip 该 scene；scene 行打印两个比值。
+- **测试**：新增版本契约/因果 datum/版本拒绝+manifest 绑定（含 fingerprint 敏感性）三测试，回归测试断言改用共享常量；61/61 通过。
+- **重建验证（0003 同 scene）**：datum 125.30→128.73（该路段为下坡：起点比全场中位数高 3.4 m——这正是旧 −2 m floor 37% 压积的根因）；floor_frac 37%→**0.38%**、ceil 0%；高度 [−8, 5.35]、24,066 unique；v2 dataset 加载 OK，旧 v1 blob 目录端到端被拒。QA 图 `runs/world_state_targets_smoke/qa/height_target_v2_qa.png`（前后高度图/直方图/等高线叠卫星/3D 表面，视觉模型复核通过）。
+- **语义注记**：因果 datum 使高度分布整体下移（p50=−4.31：下坡路远端路面在 datum 下 4~5 m），这是固定 datum 的诚实几何而非缺陷；地板 −8 m 对应"起点以下约 6 m 下坡"容限，QA gate 会在更陡 scene 上显式暴露。
+
+### 2026-08-26 — 接入正式 VGGT chunk measurement（主链最大实现缺口闭合）
+
+- **缺口核实**：assimilation/eval 的 G_t 都是 `world_enc(height*support, density*support, support)`——把 LiDAR 监督裁到当前 chunk 再编码，E3 实际验证的是"裁真值写入"；`GroundMeasurementEncoder` 在 optimizer 里却从未被 forward。
+- **新增 `world3d/unified_bev/world_vggt.py`**：`load_world_vggt_cache`（按 scene_id/world_target_version/world_target_hash 三重身份 fail-fast，重建 targets 自动作废旧缓存）；`chunk_measurement_from_cache`（fp16 缓存条目 → GroundMeasurementEncoder → GroundMeasurement，最近 unroll 步保留 meas_enc 梯度、prefix replay detach）；`teacher_measurement`（显式降级 fallback）。
+- **新增 `scripts/build_world_vggt_cache.py`**：每 scene 每 chunk（blob `chunk_table.geometry_fids` ≤8 帧 × 8 视图=64）一次独立联合 VGGT 前向，复用 v6 的 `run_joint_subset`（车辆运动定标、conf 归一化、depth/conf 回投到 96×160 视图分辨率）；缓存存 rgb/K/T_world_cam/T_world_imu/depth/conf + scale QA，逐 chunk 增量落盘可续建。
+- **assimilation/eval/probe 链**：两者接 `--vggt_cache`；eval 现在从 assimilation checkpoint 加载 `measurement_encoder`（teacher 时代从不加载）；行记录 `measurement_source`；**E3/E4 区域语义修正**——g_update/outside_latent_max/forget 改用测量自身 support（VGGT support 远于 LiDAR chunk mask，用后者判"support 外"会误报合法写入）。probe 链插入 train/test 两个缓存构建步骤。
+- **真实 smoke（0003，8 chunks）**：缓存 0.6 min（8×64 视图，全 `vehicle_motion` 定标，MAD 0.024–0.114，pose RMSE 0.23–0.67 m，conf>0.3 占 0.61–1.00）；interface 20 步 → assimilation(sat_ground, 真测量) 20 步 loss 12.7→4.6 → eval aligned 9 行 `measurement_source=vggt_cache`；**VGGT support 27,585 格 vs LiDAR chunk mask 11,141 格、Jaccard 0.389**（测量确实来自 VGGT 门控而非监督 mask）；测量-support 语义下 `outside_latent_max=0.0`（精确保持契约在真测量上成立）；teacher fallback 冒烟通过并带显式 WARNING。
+- **顺带修复**：DINOv2 hub 加载优先本地缓存（`source='local'`）——`_parse_repo_info` 在缓存命中前就会探测 GitHub main 分支，断网即挂（本机 repo+权重已在 `~/.cache/torch/hub`）。
+- **测试**：新增 meas_enc 门控（conf/depth 越界 → support 清空、support 外 confidence=0）与缓存身份/组装两测试；63/63 通过。

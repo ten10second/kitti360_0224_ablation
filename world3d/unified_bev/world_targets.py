@@ -2,8 +2,10 @@
 
 Height is ``surface_height_p90_world_z - z_datum_m``, then clipped to physical
 relative-height bounds.  ``z_datum_m`` is the median world-Z of LiDAR optical
-centers in the scene, not a per-chunk quantile.  Cells without LiDAR evidence
-stay unknown and are never labelled free space.
+centers over the FIRST chunk: it is available when mapping starts (causal —
+it never reads future vehicle positions) and stays fixed for every later
+chunk, target, and reader query.  Cells without LiDAR evidence stay unknown
+and are never labelled free space.
 
 KITTI-360 world-Z is an absolute map altitude (~115-125 m).  The physical
 height guard must therefore live in the datum-relative domain
@@ -22,6 +24,12 @@ from torch import Tensor
 
 from .data import SAT_M_PER_PX
 from .geometry import image_uv_to_grid, sparse_depth_zbuffer
+
+# Physical guard on datum-relative height.  The floor must absorb real
+# terrain: the datum sits ~1.8 m above the road (sensor height), so a -2 m
+# floor clipped ~37% of valid cells on real 0003 as soon as the road dips.
+MIN_RELATIVE_HEIGHT_M = -8.0
+MAX_RELATIVE_HEIGHT_M = 40.0
 
 
 def bev_cell_centers(origin_xy: Tensor, tile_size_m: float, resolution_m: float) -> Tensor:
@@ -129,6 +137,19 @@ def z_datum_from_centers(centers_z: Sequence[float]) -> float:
     return float(np.median(values))
 
 
+def first_chunk_datum_z(window, by_fid) -> float:
+    """Causal scene datum: median world-Z of the FIRST chunk's LiDAR optical
+    centers only.  Later chunks must not move the datum (a scene-wide median
+    would read future vehicle positions at t=0)."""
+    if not window:
+        raise ValueError("z_datum requires at least one chunk")
+    centers = [
+        float(lidar_optical_center_world(by_fid[fid].T_world_cam, by_fid[fid]._T_cam_velo)[2])
+        for fid in window[0].fids
+    ]
+    return z_datum_from_centers(centers)
+
+
 def accumulate_lidar_surface(
     points_world: np.ndarray,
     origin_xy: np.ndarray,
@@ -187,8 +208,8 @@ def height_minus_datum(
     height_world_z: np.ndarray,
     z_datum_m: float,
     *,
-    min_height_m: float = -2.0,
-    max_height_m: float = 40.0,
+    min_height_m: float = MIN_RELATIVE_HEIGHT_M,
+    max_height_m: float = MAX_RELATIVE_HEIGHT_M,
 ) -> np.ndarray:
     """Datum-relative height with the physical guard in the relative domain.
 
