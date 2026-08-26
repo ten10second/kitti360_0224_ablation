@@ -1,6 +1,7 @@
 # 实验方案 — Persistent Georeferenced World State（KITTI-360 v1）
 
-> 当前唯一对照。骨干：冻结 DINOv2-ViT-B/14（卫星）、冻结 VGGT（车端）。只训 write head 与 updater。  
+> 当前唯一对照。骨干：冻结 DINOv2-ViT-B/14（卫星）、冻结 VGGT（车端）。
+> 只训两个 write head（satellite/XY）、measurement encoder 与 updater。  
 > 不覆盖 UAV、hole、删帧、RGB 主指标、VLA、从零训卫星 ViT。
 
 ---
@@ -30,12 +31,18 @@ KITTI-360 没有 UAV，只能评 **车稍后会开到、现在还没开到** 的
 
 | 模块 | 角色 | 训/冻 |
 |---|---|---|
-| VGGT | 把 12 m chunk 变成 \(G_t, M_t\) | 冻 |
+| VGGT | 把 12 m chunk（剔除查询帧）变成 \(G_t, M_t\) 的 depth/conf | 冻 |
 | DINOv2-ViT-B/14 | 从 south-up 卫星 BEV 抽 patch 特征（resize 到 224，ImageNet 归一化） | 冻 |
 | `bilinear_splat` | 世界 XY → BEV 格子 | 不学 |
 | Stage A readers（height / density / depth） | 定义 \(Z\) 可读几何 | 先训后冻；Stage B 中 depth **不反传** |
+| `GroundMeasurementEncoder` | VGGT depth/conf + RGB + 标定位姿 → BEV 测量 \(G_t, M_t\) | **训**（单实例，两链共享同一 \(G_t\)；两链损失共同更新） |
 | 卫星 write head | DINO 特征 (+ 固定 XY 编码) \(\to Z_0\) | **训**（小投影/卷积，不训 DINO） |
-| updater \(U\) | \(Z_{t-1},G_t,M_t\to Z_t\) | **训** |
+| XY write head | 零特征 + 同一固定 XY 编码走同一 write-head 结构 | **训**（与卫星 write head 容量对齐） |
+| updater \(U\) | \(Z_{t-1},G_t,M_t\to Z_t\) | **训**（单实例，两链共享） |
+
+训练形态为 **shared_assimilation**：同一 batch 内 \(Z_t^{sat}=U(Z_{t-1}^{sat},G_t)\) 与
+\(Z_t^{xy}=U(Z_{t-1}^{xy},G_t)\) 共享完全相同的 \(G_t\)、\(M_t\)、updater 与 readers，
+初始化是唯一被操纵变量（E2 的"同一 updater"由结构保证）。\(G_t\) 每 chunk 只计算一次。
 
 VGGT 越强越好：它越强，越说明卫星的价值在「车还没到」，不在「少几帧」。  
 DINO 同理：不从零训卫星 ViT。\(W_s\) 只学「这些 patch 特征怎么写进地理格子」。XY 对照关掉 DINO 特征、只保留同一 write head + 固定 XY 编码，容量对齐的是 write head 而不是整个 ViT。
@@ -139,8 +146,10 @@ Loss：
 - \(Z_0\)：对静态累计云的 masked distill + height/density（初始化）
 - 无 depth loss、无 RGB 主损失、不把 \(Z_t\) 回归成整张未来 \(Z_{\mathrm{world}}\)
 
-分支：`sat_ground`（主）、`xy_ground`、`ground_only`、`one_shot`。  
-Random/shift 只评不训。
+分支：不再有独立训练的分支。训练只跑一次 **shared_assimilation**
+（同 batch 双链：sat-init 与 XY-init 共享测量流/updater/readers，loss 为两链之和）；
+`ground_only`（空初始化）与 `one_shot`（测量并集一次写入）只是评测期 `--control`
+变体。Random/shift 同样只评不训。
 
 ---
 

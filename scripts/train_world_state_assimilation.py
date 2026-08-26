@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Stage B: satellite/XY init + evidence-aware recurrent ground updates."""
+"""Stage B: shared assimilation — one measurement stream and one updater serve
+both the satellite-initialized and the XY-initialized chains in the same batch.
+
+Z_t^sat = U(Z_{t-1}^sat, G_t) and Z_t^xy = U(Z_{t-1}^xy, G_t) share the exact
+same G_t/M_t, updater, and frozen readers, so initialization is the only
+manipulated variable.  ground_only and one_shot are evaluation-time variants
+(eval_world_state_trajectory --control), never separately trained.
+"""
 from __future__ import annotations
 
 import argparse
@@ -20,10 +27,8 @@ from world3d.unified_bev.state_models import (  # noqa: E402
     EvidenceAwareUpdater,
     FixedXYInitializer,
     GroundMeasurementEncoder,
-    OneShotAssimilator,
     SatelliteInitializer,
     WorldGeometryEncoder,
-    one_shot_support,
 )
 from world3d.unified_bev.world_checkpoints import (  # noqa: E402
     validate_scenes_manifest,
@@ -37,7 +42,6 @@ from world3d.unified_bev.world_data import (  # noqa: E402
 from world3d.unified_bev.world_state import (  # noqa: E402
     WORLD_STATE_SCHEMA_VERSION,
     GroundMeasurement,
-    empty_state,
     supervised_region,
     visited_mask,
 )
@@ -72,8 +76,6 @@ def main():
                          "measurement path); without it the LiDAR teacher "
                          "fallback is used and the run is diagnostic only")
     ap.add_argument("--out", default="runs/world_state_assimilation")
-    ap.add_argument("--branch", choices=["sat_ground", "ground_only", "xy_ground", "one_shot"],
-                    default="sat_ground")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--unroll", type=int, default=4)
@@ -102,11 +104,13 @@ def main():
     xy_init = FixedXYInitializer(bev_height=bev, bev_width=bev, tile_size_m=ds.tile_size_m).to(device)
     updater = EvidenceAwareUpdater().to(device)
     meas_enc = GroundMeasurementEncoder(bev_height=bev, bev_width=bev).to(device)
-    trainable = list(updater.parameters()) + list(meas_enc.parameters())
-    if args.branch == "sat_ground":
-        trainable += [p for p in sat_init.parameters() if p.requires_grad]
-    elif args.branch == "xy_ground":
-        trainable += [p for p in xy_init.parameters() if p.requires_grad]
+    # one shared assimilation: the SAME G_t/M_t/updater/readers serve both
+    # chains, so init (satellite vs XY) is the only manipulated variable (E2)
+    trainable = (
+        list(updater.parameters()) + list(meas_enc.parameters())
+        + [p for p in sat_init.parameters() if p.requires_grad]
+        + [p for p in xy_init.parameters() if p.requires_grad]
+    )
     opt = torch.optim.AdamW(trainable, lr=args.lr)
     if any(id(p) in frozen_ids for g in opt.param_groups for p in g["params"]):
         raise RuntimeError("Stage B optimizer contains a frozen interface parameter")
@@ -114,7 +118,7 @@ def main():
     iterator = iter(loader)
     t0 = time.time()
     running = 0.0
-    print(f"[world-b] branch={args.branch} scenes={len(ds)} device={device}")
+    print(f"[world-b] shared_assimilation (sat-chain + xy-chain) scenes={len(ds)} device={device}")
     for step in range(1, args.steps + 1):
         try:
             inputs, sup, blob = next(iterator)
@@ -137,22 +141,6 @@ def main():
         with torch.no_grad():
             z_world = world_enc(height, density, valid)
 
-        if args.branch == "ground_only":
-            state = empty_state(spec, 64, device=device)
-        elif args.branch == "xy_ground":
-            state = xy_init(sat, spec)
-        else:
-            state = sat_init(sat, spec)
-
-        init_loss = masked_smooth_l1(height_r(state.latent), height, valid) + masked_smooth_l1(
-            density_r(state.latent), density, valid,
-        )
-        # masked distill per experiment_plan §6: only where the static cloud
-        # actually labels; an unmasked distill would pull the satellite prior
-        # in ahead regions toward the teacher's "unknown" extrapolation
-        distill = masked_smooth_l1(state.latent, z_world, valid)
-        loss = init_loss + 0.1 * distill
-
         def _chunk_measurement(t: int, detach_latent: bool) -> GroundMeasurement:
             if args.vggt_cache is not None:
                 return chunk_measurement_from_cache(
@@ -169,39 +157,50 @@ def main():
             latent = world_enc(height * support, density * support, support)
             return teacher_measurement(latent, support, t + 1)
 
-        measurements = []
+        # ONE measurement stream consumed by BOTH chains: identical G_t/M_t
+        prefix = []
+        recent = []
         n_back = min(args.unroll, t_chunks)
         start = max(0, t_chunks - n_back)
         for t in range(start):
-            with torch.no_grad():
-                state = updater(state, _chunk_measurement(t, True)).state
+            meas = _chunk_measurement(t, True)
+            prefix.append(meas)
         for t in range(start, t_chunks):
-            # recent steps keep measurement gradients so GroundMeasurementEncoder
-            # trains through the updater loss; prefix replay detaches
-            meas = _chunk_measurement(t, False)
-            measurements.append(meas)
-            if args.branch == "one_shot":
-                continue
-            prev = state
-            update = updater(state, meas)
-            state = update.state
-            # supervise only where BOTH the measurement writes and the static
-            # target labels; VGGT support beyond LiDAR coverage has height=0
-            # placeholders, not ground truth (pseudo-negative labels otherwise)
-            supervised = supervised_region(meas.support, valid)
-            loss = loss + masked_smooth_l1(height_r(state.latent), height, supervised)
-            loss = loss + masked_smooth_l1(density_r(state.latent), density, supervised)
-            if t > 0:
-                loss = loss + 0.1 * masked_smooth_l1(
-                    height_r(state.latent), height_r(prev.latent).detach(), visited_mask(chunk_support, t),
-                )
-        if args.branch == "one_shot" and measurements:
-            state = OneShotAssimilator(updater)(state, measurements).state
-            # the loss region must match what the aggregator actually wrote:
-            # the union of the measurement supports, not the LiDAR mask
-            final = supervised_region(one_shot_support(measurements), valid)
-            loss = loss + masked_smooth_l1(height_r(state.latent), height, final)
-            loss = loss + masked_smooth_l1(density_r(state.latent), density, final)
+            # recent steps keep measurement gradients so the shared
+            # GroundMeasurementEncoder trains through both chains' losses
+            recent.append(_chunk_measurement(t, False))
+
+        def _run_chain(state):
+            """Assimilate one chain through the shared measurement stream."""
+            loss = masked_smooth_l1(height_r(state.latent), height, valid) + masked_smooth_l1(
+                density_r(state.latent), density, valid,
+            )
+            # masked distill per experiment_plan §6: only where the static
+            # cloud labels; unmasked would pull the satellite prior in ahead
+            # regions toward the teacher's "unknown" extrapolation
+            loss = loss + 0.1 * masked_smooth_l1(state.latent, z_world, valid)
+            with torch.no_grad():
+                for meas in prefix:
+                    state = updater(state, meas).state
+            for meas in recent:
+                prev = state
+                state = updater(state, meas).state
+                # supervise only where BOTH the measurement writes and the
+                # static target labels; VGGT support beyond LiDAR coverage
+                # holds placeholder zeros, not ground truth
+                supervised = supervised_region(meas.support, valid)
+                loss = loss + masked_smooth_l1(height_r(state.latent), height, supervised)
+                loss = loss + masked_smooth_l1(density_r(state.latent), density, supervised)
+                if meas.chunk_index > 1:
+                    loss = loss + 0.1 * masked_smooth_l1(
+                        height_r(state.latent), height_r(prev.latent).detach(),
+                        visited_mask(chunk_support, meas.chunk_index - 1),
+                    )
+            return state, loss
+
+        _, loss_sat = _run_chain(sat_init(sat, spec))
+        _, loss_xy = _run_chain(xy_init(sat, spec))
+        loss = loss_sat + loss_xy
 
         opt.zero_grad(set_to_none=True)
         if loss.requires_grad:
@@ -210,6 +209,7 @@ def main():
         running += float(loss.detach())
         if step == 1 or step % 20 == 0:
             print(f"step={step}/{args.steps} loss={running / (20 if step >= 20 else step):.4f} "
+                  f"sat={float(loss_sat):.4f} xy={float(loss_xy):.4f} "
                   f"elapsed={time.time()-t0:.1f}s", flush=True)
             running = 0.0
         if step == args.steps or step % 100 == 0:
@@ -220,7 +220,7 @@ def main():
                 "xy_initializer": xy_init.state_dict(),
                 "updater": updater.state_dict(),
                 "measurement_encoder": meas_enc.state_dict(),
-                "branch": args.branch,
+                "branch": "shared_assimilation",
                 "measurement_source": "vggt_cache" if args.vggt_cache else "lidar_teacher_fallback",
                 "step": step,
                 "config": vars(args),

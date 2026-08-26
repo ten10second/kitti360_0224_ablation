@@ -50,23 +50,15 @@ PY
   --scenes "$ROOT/targets_train" --out "$ROOT/interface" \
   --steps "$INTERFACE_STEPS" --device cuda
 
-for branch in sat_ground xy_ground ground_only one_shot; do
-  "${PY[@]}" scripts/train_world_state_assimilation.py \
-    --scenes "$ROOT/targets_train" --interface "$ROOT/interface/world_interface.pt" \
-    --vggt_cache "$ROOT/vggt_cache_train" \
-    --out "$ROOT/assim_${branch}" --branch "$branch" --steps "$ASSIM_STEPS" --device cuda
-done
+"${PY[@]}" scripts/train_world_state_assimilation.py \
+  --scenes "$ROOT/targets_train" --interface "$ROOT/interface/world_interface.pt" \
+  --vggt_cache "$ROOT/vggt_cache_train" \
+  --out "$ROOT/assim_shared" --steps "$ASSIM_STEPS" --device cuda
 
 for control in aligned xy random shift_cross sat_only ground_only one_shot world_upper; do
-  assim="$ROOT/assim_sat_ground/assimilation.pt"
-  case "$control" in
-    xy) assim="$ROOT/assim_xy_ground/assimilation.pt" ;;
-    ground_only) assim="$ROOT/assim_ground_only/assimilation.pt" ;;
-    one_shot) assim="$ROOT/assim_one_shot/assimilation.pt" ;;
-  esac
   "${PY[@]}" scripts/eval_world_state_trajectory.py \
     --scenes "$ROOT/targets_test" --interface "$ROOT/interface/world_interface.pt" \
-    --assimilation "$assim" --control "$control" \
+    --assimilation "$ROOT/assim_shared/assimilation.pt" --control "$control" \
     --vggt_cache "$ROOT/vggt_cache_test" \
     --records_out "$ROOT/eval_${control}.jsonl" --device cuda
 done

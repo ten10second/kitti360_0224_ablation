@@ -246,3 +246,18 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 - **one-shot 遗漏（外部审查指出）**：final 损失区域原用 `sup.final_support`（累计 LiDAR support），与 one-shot 聚合器实际写入区域不一致——会在"LiDAR 有标签、VGGT 没写入"处计算损失、漏掉"VGGT 写入且有效"的格。新增 `state_models.one_shot_support(measurements)`（测量 support 并集）+ `test_one_shot_support_matches_aggregate_write_region`（与 `aggregate_measurements` 写入区域逐位相等）；训练改 `supervised_region(one_shot_support(measurements), valid)`。
 - **查询隔离（此前 depth_absrel 非严格 held-out）**：旧契约 `geometry_fids`（lift+ctx 全成员）含 core 查询帧——实测 0003 smoke **8 chunk 中 3 个（37.5%）query 帧在测量帧内**。v2 修复：构建端剔除 `core_fid`、从同 chunk 未用帧按弧距最近补足（仍 8 帧 64 视图）、entry 存 `measurement_fids`+`query_fid` 并断言 disjoint；加载端 `assert_query_isolation`（缺字段=query 隔离前旧缓存、query_fid 不匹配、泄漏三种 fail-fast）；`WORLD_VGGT_CACHE_VERSION`→`world_vggt_chunk_measurement_v2`；v1 缓存已删除重建。
 - **验证**：65/65 单测（缓存测试扩三断言：身份不匹配/泄漏/旧 schema）；重建 0.6 min 全 vehicle_motion（MAD 0.022–0.114）；链路 smoke（sat_ground 20 步 + one_shot 2 步 + eval aligned）通过，`outside_latent_max=0.0` 保持，`depth_absrel≈0.74–0.81`（严格 held-out 下的 20-step smoke 值，不作效果结论）。
+
+### 2026-08-26 — 四分支收敛为 shared_assimilation（E2 的结构化落实）
+
+- **动机**：旧链四次独立训练（sat_ground/xy_ground/ground_only/one_shot）各自产出 updater/meas_enc——E2 的"同一 updater：sat-init vs XY-init"对比被 updater 权重差异混淆。
+- **新训练形态**：同 batch 内两条链 `Z_t^sat=U(Z_{t-1}^sat,G_t)`、`Z_t^xy=U(Z_{t-1}^xy,G_t)` 消费**同一条测量流**（prefix detach 一次计算、recent 带梯度供两链共享）、同一个 updater、同一组冻结 readers；训练参数=updater+meas_enc+两个 write head（satellite/XY 各一，容量对齐）；loss=两链之和（updater 从两链收梯度，学的是与初始化无关的同化算子）。ground_only/one_shot 降为纯评测期变体（--control 改 init/聚合方式），不再训练。
+- **checkpoint**：`branch="shared_assimilation"`，单文件含 sat/xy 初始化器+updater+measurement_encoder；eval 全部 8 个 control 共用它；probe 链从 4 次训练变 1 次。
+- **保留语义**：chunk 损失仍在 `supervised_region(meas.support, valid)`；distill 仍 masked valid；retention 仍 visited_mask；查询隔离/缓存 v2 不变。
+- **smoke（0003，20 步）**：两链 loss sat 13.28→3.07 / xy 17.86→3.15；四 control 单 ckpt 评测——t=0 ahead MAE 排序已符合 E1 预期方向：satellite 0.898 < XY 1.067 < 空初始化 2.544（one_shot t=0 与 aligned 逐位一致=共享初始化验证）；recurrent control 末行 g_update 为正（0.02–0.03，smoke 量级）、outside=0.0 保持。
+- 65/65 单测通过。
+
+### 2026-08-26 — shared_assimilation 定稿：测量单次计算确认 + plan 对齐 + 测试裁剪
+
+- **用户裁定**：保留共享联合训练（meas_enc 单实例由两链损失共同训练，不改为随机冻结）；确认实现中每 chunk 的 measurement 恰好计算一次（`prefix`/`recent` 列表在 `_run_chain` 外构建一次，两链闭包消费同一对象；meas_enc 每 chunk 只前向一次）。
+- **experiment_plan 对齐**：§2 训/冻表新增 `GroundMeasurementEncoder`（训、单实例共享）与 XY write head（训、容量对齐）两行；表后写明 shared_assimilation 双链共享 G_t/M_t/updater/readers、G_t 每 chunk 只算一次；§6 分支段改为"不再有独立训练分支，ground_only/one_shot 仅评测期 --control"。
+- **测试裁剪（65→39）**：test_unified_bev.py 48→22——删除退役 frame-completion 路径的全部契约（LatentCompletion/alpha 恒等/coordinate_only completion、卫星 ViT/heightmap prior、nadir 往返、M3D 双 crop、observation RGB 损失、B7 道路系控制、LPIPS/SSIM、frame Stage-A/B checkpoint schema、v6 frame-cache attach 身份）；三个测试缩减为只测存活部分（ColumnFieldDecoder 渲染、fixed_relative_xy_encoding、masked_smooth_l1 空 mask）；保留 world 链活代码契约（几何约定/splat/height_statistics/unproject/GroundDenseBEVEncoder/front2 内参/VGGT 定标四件/chunks/readers 冻结）。裁剪后 39/39 通过。
