@@ -73,15 +73,6 @@ def main():
     ap.add_argument("--cache", default=None, help="prebuilt sample cache; serving from RAM, workers forced to 0")
     ap.add_argument("--geometry_cache", "--m3d_cache", dest="geometry_cache", default=None,
                     help="dense geometry cache (Metric3D or joint-view VGGT)")
-    ap.add_argument("--chunked", action="store_true",
-                    help="route-chunk windows (cache v7); the dense lift is the union of "
-                         "all chunks' lift frames and queries are the per-chunk core frames")
-    ap.add_argument("--chunks_per_window", type=int, default=4)
-    ap.add_argument("--chunk_arc_m", type=float, default=12.0)
-    ap.add_argument("--guard_m", type=float, default=4.0)
-    ap.add_argument("--frames_per_chunk", type=int, default=2)
-    ap.add_argument("--max_geometry_frames", type=int, default=8)
-    ap.add_argument("--window_stride", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--resume", default=None, help="checkpoint to resume from")
     args = ap.parse_args()
@@ -90,23 +81,10 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(args.seed)
 
-    if args.chunked and not args.geometry_cache:
-        raise ValueError("--chunked requires --geometry_cache (chunk cache v7)")
     if args.cache and args.geometry_cache:
         ds = load_dense_cached_unified_bev(args.cache, args.geometry_cache)
     elif args.cache:
         ds = load_cached_unified_bev(args.cache)
-    elif args.chunked:
-        from world3d.unified_bev.data import ChunkedUnifiedBEVDataset, attach_chunk_geometry
-        ds = attach_chunk_geometry(ChunkedUnifiedBEVDataset(
-            args.manifest, lidar_root=args.lidar_root, drive=args.drive,
-            chunks_per_window=args.chunks_per_window, chunk_arc_m=args.chunk_arc_m,
-            guard_m=args.guard_m, frames_per_chunk=args.frames_per_chunk,
-            max_geometry_frames=args.max_geometry_frames,
-            window_stride=args.window_stride, max_samples=args.max_samples,
-            image_size=(args.image_width, args.image_height),
-            max_points_per_view=args.max_points,
-        ), args.geometry_cache)
     else:
         ds = UnifiedBEVDataset(
             args.manifest, lidar_root=args.lidar_root, dense_source_count=args.dense_sources,
@@ -250,14 +228,6 @@ def main():
                 "bev_resolution_m": ds.bev_resolution_m, "bev_size": ds.bev_size,
                 "image_size": ds.image_size, "step": step,
             }
-            if args.chunked:
-                checkpoint["chunk_config"] = {
-                    "chunks_per_window": int(ds.chunks_per_window),
-                    "chunk_arc_m": float(ds.chunk_arc_m),
-                    "guard_m": float(ds.guard_m),
-                    "frames_per_chunk": int(ds.frames_per_chunk),
-                    "chunking_version": str(ds.chunking_version),
-                }
             checkpoint["fingerprint"] = compute_stage_a_fingerprint(checkpoint)
             torch.save(checkpoint, out / "stage_a.pt")
     print(f"[stage-a] checkpoint={out / 'stage_a.pt'}")

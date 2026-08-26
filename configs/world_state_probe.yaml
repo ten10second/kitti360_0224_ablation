@@ -1,0 +1,39 @@
+task_family: persistent_world_state
+schema_version: world_state_v1
+data:
+  tile_size_m: 100.0
+  resolution_m: 0.5
+  sat_m_per_px: 0.196
+  chunk_arc_m: 12.0
+  frames_per_chunk: 4
+  max_geometry_frames: 8
+  max_chunks: 8
+  z_datum_policy: lidar_optical_center_world_z_median_v1
+  lidar_root: /media/shizhm/sda2/KITTI360_lidar/data_3d_raw
+  train_manifest: dataset_splits/kitti360_geofence_buffer30/train_manifest.jsonl
+  test_manifest: dataset_splits/kitti360_geofence_buffer30/test_manifest.jsonl
+model:
+  latent_channels: 64
+  c_init: 0.25
+  unroll: 4
+  ray_samples: 24
+train:
+  interface_steps: 200
+  assimilation_steps: 200
+  lr: 0.0002
+  seed: 0
+  batch_size: 1
+eval:
+  min_region_cells: 256
+  bootstrap: 10000
+  held_out_scenes: 32
+  seeds: 3
+controls:
+  - aligned
+  - xy
+  - random
+  - shift_cross
+  - sat_only
+  - ground_only
+  - one_shot
+  - world_upper

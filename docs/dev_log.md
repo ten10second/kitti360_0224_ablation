@@ -174,8 +174,30 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 - **验证**：50/50 单测（新增 5 项：弧长切分/跳变、hole 模式与 guard、lift⊆geometry∧全 K guard、identity 幂等、chunk 计数 alpha 表）；1-tile 真实 GPU smoke 全链通过（cache→A→B→eval→C2→L_equiv）。
 - **已知事实**：K=2 时 M_hole≈6.5%、hole_core≈3.4%——kept chunk 相机的远距可见性仍覆盖多数 BEV，hole 大小由 conf 门控与 K 共同决定，属实验结果而非缺陷；完整 20k/10k 训练未启动。
 
-## 运行说明（chunk 链）
+### 2026-08-25 — 主线改为 persistent georeferenced world state
 
-```bash
-WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_chunk_chain.sh
-```
+- **动机**：chunk 内删帧不能构成卫星不可替代的空间缺口；新主问题是异步 overhead/ground 观测如何初始化并持续更新同一个地理对齐世界状态。讨论稿 `todo/persistent_georeferenced_world_state.md`，计划 `.omx/plans/persistent-georeferenced-world-state.md`。
+- **新增模块**：`world_state.py`（契约/provenance/ModelInputs 隔离）、`world_targets.py`（固定 datum + georeferenced satellite resample）、`world_data.py`（100 m scene tile）、`state_models.py`（world encoder、卫星/XY initializer、updater、one-shot）、`world_checkpoints.py`（`world_state_v1`）。
+- **新主链**：`scripts/run_world_state_probe.sh` → target build → Stage A interface → assimilation 四分支 → trajectory eval → paired bootstrap。
+- **v1 边界**：无 UAV/VLA；off-route 只作 diagnostic；measurement 在未接 VGGT cache 时用 support-masked world teacher 作为 updater 输入（几何证据来自累计 LiDAR support，不是自由 attention）。
+- **不 commit**：按用户约束本轮不自动 commit/push。
+
+### 2026-08-26 — 删除 spatial hole-probe
+
+- **删除**：`run_unified_bev_chunk_chain.sh`、`eval_unified_bev_chunk_probe.py`、`consistency_unified_bev_chunk.py`、`l_equiv_analysis.py`；`ChunkedUnifiedBEVDataset` 与 chunk cache v7 attach；Stage A/B / VGGT builder 的 `--chunked` 挖洞路径；`missing_chunks` / `guard_keep_mask` / `build_chunk_windows`。
+- **保留**：`chunks.py` 的弧长切段与 `select_chunk_frames`，仅供 world-state 作为测量包。旧 hole checkpoint 若带 `chunk_config` 会被 Stage-A loader 拒绝。
+- **文档**：README / user_requirements 不再把 hole-probe 标为可运行预实验。
+
+### 2026-08-26 — 固化实验方案
+
+- 写入 `docs/experiment_plan.md`：四实验（ahead 先验、优于 XY、到达写入、不遗忘）；静态真值用 `data_3d_semantics`，当前包去前景用 `data_3d_bboxes`；只训 \(W_s\) 与 \(U\)，VGGT 冻结。
+
+### 2026-08-26 — 卫星骨干改为冻结 DINOv2
+
+- `SatelliteInitializer` 不再从零训 ViT。默认 `dinov2_vitb14` 冻住抽特征，只训 `write_head`（DINO token 插值到 200×200 + 固定 XY 编码）。
+- `FixedXYInitializer` 不跑 DINO，零特征走同一 write head。checkpoint 不保存 DINO 权重。
+- 单测用 `backbone='tiny'`，避免拉取 hub。
+
+### 2026-08-26 — 实验方案重梳
+
+- `docs/experiment_plan.md` 与当前实现对齐：DINOv2 冻特征 + write head 初始化 \(Z_0\)；VGGT 冻测量；四实验 E1–E4 为全部主验证。

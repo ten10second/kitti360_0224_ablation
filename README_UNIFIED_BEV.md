@@ -1,8 +1,16 @@
 # Unified KITTI-360 BEV latent probe
 
-This is the new two-stage path described in
-`todo/kitti360_unified_bev_latent_implementation_spec.md`.  It is kept
-separate from the legacy VQ/AR path.
+The **paper main line** is persistent georeferenced world-state assimilation
+(`todo/persistent_georeferenced_world_state.md`).
+The locked experiment protocol is `docs/experiment_plan.md`.
+
+```bash
+bash scripts/run_world_state_probe.sh
+```
+
+A 100 m scene tile sits inside one 512×512×0.196 m/px satellite crop.
+Chunks are 12 m arcs; they are measurement packets, not a sparsity axis.
+Off-route 3D is a coverage diagnostic on KITTI-360 v1, not a headline.
 
 The local KITTI-360 satellite convention is `512x512`, north-up, vehicle
 -centered, and `0.196 m/px`.  LiDAR is read from:
@@ -43,9 +51,22 @@ conda run -n maskgit python scripts/check_unified_bev_replay.py \
   --drive 2013_05_28_drive_0003_sync
 ```
 
-## Claim-aligned pipeline (2026-08-24)
+## Persistent world-state pipeline (2026-08-25)
 
-The supported main path is now:
+Scene-centered 100 m tiles, satellite initialization \(Z_0\), then recurrent
+ground-chunk updates \(Z_t=U(Z_{t-1},G_t,M_t)\).  Stage A fits a
+world-defined encoder plus frozen height/density/depth readers.  Stage B
+never sees future-route labels.  Evaluator reports visited/ahead curves,
+update gain, forgetting, and held-out depth.
+
+```bash
+bash scripts/run_world_state_probe.sh
+```
+
+## Historical unified-BEV completion (not the paper claim)
+
+Frame-centered dense/sparse completion remains in the tree for replay of
+older runs.  It is not the current experiment.  The orchestrator was:
 
 ```bash
 bash scripts/run_unified_bev_claim_probe.sh

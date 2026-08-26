@@ -1,12 +1,14 @@
-# User Requirements — Unified BEV Claim Probe
+# User Requirements — Persistent Georeferenced World State
 
 ## Research Direction
 
-- 核心 claim：先由 dense ground 定义并冻结 `ground-generative BEV latent space`；再由配准卫星图与 sparse ground 恢复该空间中的场景状态。
-- 卫星负责全局布局与几何先验，稀疏街景负责局部真实外观；不主张卫星恢复不可见立面的真实高频纹理。
-- 主证据必须来自同一个 Stage-A ground-trained、Stage-B frozen 的 RGB/depth renderer 与 geometry readout。
-- aligned satellite 必须在地理隔离测试集上优于 ground-only、fixed-XY、misaligned/random satellite，尤其是在 sparse-ground 未支持区域的冻结几何指标上。
-- raw latent equality、VGGT、DPT 名称、加权 splat、uncertainty 本身都不是 headline contribution。
+- 核心 claim：不同高度、不同时间到达的空间观测，被持续吸收到一个地理坐标固定、可更新、可查询的三维世界状态中。
+- 卫星在车辆到达前初始化大范围低频静态结构；车端以固定长度 chunk 逐段到达，对同一状态做局部确认、细化和纠错。
+- 状态由累计 LiDAR 定义的 world geometry 及其冻结 readers 约束，而不是由 dense-ground encoder 单独定义全部语义。
+- 主证据是状态轨迹 \(Z_0\rightarrow Z_T\) 上的 visited / ahead 几何、update gain、retention，以及 held-out depth reader transfer。实验方案以 `docs/experiment_plan.md` 为准。
+- chunk 只作为固定长度的车端测量包，不再做 chunk 内删帧或 spatial hole completion。
+- 不主张卫星恢复精确立面、动态物体或无真值的 off-route 完整 3D。KITTI-360 v1 的 off-route 只作 coverage diagnostic。
+- raw latent equality、VGGT、DINO、DPT 名称、加权 splat、校准概率 uncertainty 本身都不是 headline contribution。卫星骨干用冻结 DINOv2，只训写到 \(Z_0\) 的小 write head。
 
 ## Data and Geometry Constraints
 
@@ -24,7 +26,8 @@
 - 框架沿用现有 PyTorch 代码与 `maskgit` conda 环境。
 - 保护当前未提交修改，不回退用户已有工作。
 - `coordinate_only` 只使用固定公制 relative-XY/Fourier encoding，不允许可学习逐 cell 表。
-- Stage B 不使用显式概率 uncertainty；只报告确定性的 observation support/provenance。
+- Stage B / updater 不使用显式概率 uncertainty；confidence 是确定性的 normalized evidence strength。只报告 observation support / provenance / last_update。
+- 主线使用 schema `world_state_v1`、独立脚本和 `runs/world_state_*` 输出目录。spatial hole-probe 已删除。
 - satellite direct-height auxiliary 默认关闭或低权重，不能替代统一 latent 的冻结 geometry readout。
 - `render_nadir()` 仅保留为 QA/可视化，不进入主训练损失。
 - 首轮自动运行语法检查、单元测试和小规模 smoke test；20k/10k 全训练和多卡训练在代码 gate 通过后再启动。
