@@ -268,3 +268,40 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 - **结果（held-out 0003）**：dino r=+0.600（train 0.785）≫ xy r=−0.347；shuffle r=+0.441（布局绑定贡献 0.6→0.44 的下降）；scratch r=+0.259（22 scene 下从零 encoder 过拟合，held-out 崩）；hMAE：dino 3.23 < scratch 3.16 ≈ shuffle 3.39 < xy 3.63 < 常数 3.70。**关键分解：全部臂 bias≈+2.5~3.1 m**——eval scene 是下坡路（高度中位 −4.3）而训练 scene 全平地，绝对标定不迁移；bias 校正后 dino MAE 3.39→2.15。视觉复核（e0_vis.png）：预测与真值的道路走廊/建筑 footprint 结构对应，残差以系统性偏置为主。
 - **判决**：①**信息存在**——冻结 DINO 特征携带可跨 scene 迁移的布局信息（r=0.60 且 shuffle/xy 对照干净），E1 有东西可测；②**冻结骨干的选择在当前数据量下是对的**——从零 CNN 显著更差；③**绝对高度标定不可从卫星学**（地形分布依赖），这本来就是状态的分工：Z_0 给布局（低频），updater 的地面测量负责绝对标定（E3）——E1 判读必须看 bias 分解/Pearson，纯 MAE headline 会低估先验价值。density 各臂几乎无分化（0.176–0.201），layout 信号主要在 height。
 - 产物：`scripts/probe_world_satellite_prior.py`、`runs/world_state_e0/{summary.json, e0_vis.png}`；targets_train 22 scene（可复用）。
+
+### 2026-08-27 — E0 勘误与定版：数字矛盾修正 + centered MAE 入代码（外部审查指出）
+
+- **修正 1（不等式反向）**：上一条记录写 "dino 3.23 < scratch 3.16" ——不等号方向错了。正确排序（首次运行）：scratch 3.158 < dino 3.230 < shuffle 3.387 < xy 3.631；**hMAE 上 dino 并不优于 scratch**，dino 的优势在 Pearson（0.600 vs 0.259）与 centered MAE（2.15 vs ~2.26）。
+- **修正 2（数字来源混淆）**：3.230 = 探针首次运行（held-out 0003 的 valid 区域；该 scene 上 valid 与 route 数值逐位一致）；3.39→2.15 = 可视化时的**另一次独立重训**（未定 RNG 的 scene 顺序导致两 run 结果不同）。两数不同源，不应混排在同一句里。
+- **根因修复**：scene 顺序此前用 numpy 全局 RNG、未随 `--seed` 播种——已加 `np.random.seed(args.seed)`；`evaluate()` 正式新增 `height_centered_mae`（去均值偏置）与 `height_median_centered_mae`（去中位偏置，更稳健），每次运行自动落盘 summary.json。
+- **定版数字（fully-seeded 单次运行，held-out 0003，valid=route）**：
+  | arm | hMAE | bias | centered | med-centered | r |
+  |---|---|---|---|---|---|
+  | dino | 3.402 | +2.901 | **2.202** | 2.186 | **+0.469** |
+  | scratch | 3.412 | +3.087* | 2.272 | 2.268 | +0.403 |
+  | shuffle | 3.540 | +2.965* | 2.459 | 2.452 | −0.140 |
+  | xy | 3.571 | +3.061 | 2.525 | 2.509 | −0.328 |
+  （*为同 run 内数值；mean 常数基线 hMAE 3.702）
+- **三次运行的稳定性（诚实记录单 scene 评测的方差）**：dino held-out r ∈ [+0.469, +0.600]（三次均最高且恒正）；xy 恒负 [−0.368, −0.328]；dino centered MAE 恒 < xy（2.15–2.20 vs 2.52–2.54）；全臂 bias 恒 ≈ +2.9~3.1。**结论对 run-to-run 方差稳健：信息存在/安慰剂干净/绝对标定不可学；但精确数字必须多 scene × 多 seed 才能上 headline（与 experiment_plan 的 32 scene × 3 seed 协议一致）。**
+
+### 2026-08-27 — 高度校正探针：整移 vs 坡度 + oracle/VGGT 校正条件（scripts/probe_height_correction.py）
+
+- **Part 1（残差形状诊断，held-out 0003）**：卫星预测（E0 dino 臂）减 LiDAR 的残差，常数 vs 最小二乘倾斜平面：valid 区 raw 3.402 → 常数(中位) 2.186 → **平面 0.906**；ahead 区 raw 3.671 → 常数 3.178 → **平面 0.924**；拟合坡度 75–81 m/km。**判决：误差主体是倾斜平面（下坡趋势没被预测），不是整体抬升**——状态机若要加全局标定，需要缓变地形坡度，单个标量修正的上限就是常数行（ahead 只能 3.67→3.2）。
+- **Part 2（校正条件，ahead=4,147 格）**：oracle 标量（LiDAR 定偏，用答案）：+3.414 m → ahead MAE 3.671→3.238（几乎无改善，与 Part 1 一致）；**VGGT-chunk1 标量：−3.762 m，符号反**（差 oracle 7.2 m），校正后 MAE 6.622 比不校还差。
+- **符号反转根因（诊断三连）**：VGGT 测量 BEV 高度（门控 unproject + z splat 列均值 − datum）在 overlap 上 `h_meas−gt` 中位 **+6.87 m**；分层：抬升格(gt>1)≈**+0.02**、近(<20m)路面 +1.7、**远(>20m)路面 +8.6**；corr(err, 距离)=+0.66。即误差随距离增长（远距/下坡像素深度欠估→点落在更近更高处，远格被高空内容填充），非整图常数。近限校正（<15/20/30m，只用可部署信息）仍为 −0.6~−1.4：无标签近处 support 格（天空线/立面列均值）继续污染中位。
+- **判决**：①"整体高度修正值"**不能**按原设想进状态机——标量无上限增益且 VGGT 列均值 z 在远处/无标签格不可信；②正确顺序是先修测量侧统计量：每格 z 改用**低分位数（地面包络）**而非列均值 + 标定用格限近距，之后再考虑从已驶过轨迹的近格拟合**沿路坡度（1D）**而非全局标量；③本 scene 是下坡最坏情形，平地 scene 的远距偏差待多 scene 验证——但失败模式真实存在，标定设计必须先过它。
+- 产物：`runs/world_state_e0/height_correction.json`（Part1/Part2 全量）。
+
+### 2026-08-27 — 用户裁定：两条代码禁令落档
+
+- **不做 1**：不给状态加单一全局高度 offset（坡度主导的残差让标量没有上限增益）。
+- **不做 2**：不用当前 VGGT BEV 列均值高度做全局校准（远距被高空内容污染、offset 符号会反）。
+- 已写入 `docs/experiment_plan.md` §8「不做」清单（各附一行实测依据）；`state_models.py` 列均值 z splat 处加 CAUTION 注释（含 +8.6 m/>20 m/corr=0.66 数字与"低分位数替代"方向），防止未来误用为标定源。测量侧低分位数地面包络为后续另议项，本轮不动代码。
+
+### 2026-08-27 — 测量高度统计量重设计：地面包络 + 可靠距离门 + 车辆位姿锚定（用户五点方案）
+
+- **定性（用户分析）**："VGGT 标量校正"本是拿第一包局部观测修整图——下坡路上一个数字本就修不好；车端其实带来了局部高度信息，是列均值把它算坏了（抬升 +0.02/近 +1.7/远 +8.6 分层为证）。正确过程：卫星给布局（前方坡度未知）→ 每到达一段写准一段 → 前方等到达。不是第一包校准整图。
+- **实现**：①`geometry.ground_height_quantile`（硬 bin + 双趟稳定排序取每格 z 低分位=地面包络，替代 bilinear 列均值）；②`GroundMeasurementEncoder` 新增 `reliable_range_m=25`（超距像素整门控剔除——support 只含可靠域，前方等到达）、`ground_quantile=0.15`、`camera_height_above_road_m=1.75`（从 21 个训练 scene 数据定标的中位，与 KITTI-360 文档 1.73 m 吻合；非 eval 调参）；③新 `ground_field()` 方法：门控→unproject→低分位→**相机位姿 z − 1.75 作 chunk 局部路面基准**、残差中位偏移在测量内部扣除（绝不外溢为状态级全局 offset，遵守 §8 禁令）。
+- **实测（0003 chunk1，旧→新）**：support 28,127→7,831（只写可靠域）；写入格内中位偏差 **+6.87→+1.09 m**、MAE **7.70→2.26 m**；近(<20m)中位 +0.67/MAE 1.21；anchor=−0.79 m（本 chunk VGGT 地面整体偏低被扣除）。与 LiDAR 标签 overlap 0.73→0.84（可靠域与标签对齐更好）。
+- **链路**：assimilation 20 步 + eval aligned 全通；`outside_latent_max=0.0` 精确保持不变；`update_support_cells` 7,831 落盘可审计。
+- **测试**：新增 ground_height_quantile 包络（均值会读 125、分位数读 122）、ground_field 锚定（齐次位姿取 z 的 [3,3]→[2,3] bug 在测试中暴露并修复）、可靠距离门（depth=30>25m → support 空）三测试；41/41 通过。

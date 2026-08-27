@@ -194,6 +194,64 @@ def height_statistics(
     return h_mean, h_var
 
 
+def ground_height_quantile(
+    points_world: torch.Tensor,
+    points_valid: torch.Tensor,
+    origin_xy: torch.Tensor,
+    resolution_m: float,
+    height: int,
+    width: int,
+    *,
+    quantile: float = 0.15,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-cell low quantile of world Z: the ground envelope.
+
+    A column MEAN over everything unprojecting into one BEV cell mixes
+    road, facades, canopies and stray far depths — measured +8.6 m high on
+    road cells beyond 20 m on a descending scene.  A low quantile keeps the
+    ground surface.  Hard pixel-corner binning (no bilinear spreading).
+    Returns ``(z_ground, count)``, each ``(B,1,H,W)``; empty cells are 0.
+    """
+    if not 0.0 <= quantile <= 1.0:
+        raise ValueError(f"quantile must be in [0,1], got {quantile}")
+    B = points_world.shape[0]
+    z_map = points_world.new_zeros((B, 1, height, width))
+    c_map = points_world.new_zeros((B, 1, height, width))
+    cells_hw = height * width
+    for b in range(B):
+        pts = points_world[b].reshape(-1, 3)
+        keep = points_valid[b].reshape(-1)
+        pts = pts[keep]
+        if pts.numel() == 0:
+            continue
+        local = (pts[:, :2] - origin_xy[b].to(pts.dtype)) / float(resolution_m)
+        col = torch.floor(local[:, 0]).long()
+        row = torch.floor(local[:, 1]).long()
+        z = pts[:, 2]
+        inside = (
+            (col >= 0) & (col < width) & (row >= 0) & (row < height)
+            & torch.isfinite(z)
+        )
+        if not bool(inside.any()):
+            continue
+        flat = row[inside] * width + col[inside]
+        zz = z[inside]
+        # sort by z, then a stable sort by cell: within each cell the z
+        # order survives, so each cell's points are contiguous and ascending
+        by_z = torch.argsort(zz)
+        order = by_z[torch.argsort(flat[by_z], stable=True)]
+        sorted_z, sorted_f = zz[order], flat[order]
+        counts = torch.bincount(sorted_f, minlength=cells_hw)
+        nonzero = counts > 0
+        offs = torch.cumsum(counts, 0) - counts
+        k = (float(quantile) * (counts[nonzero] - 1)).long()
+        picked = sorted_z[offs[nonzero] + k]
+        nz = torch.nonzero(nonzero).squeeze(-1)
+        z_map[b, 0].view(-1)[nz] = picked.to(z_map.dtype)
+        c_map[b, 0].view(-1)[nz] = counts[nonzero].to(c_map.dtype)
+    return z_map, c_map
+
+
 def relative_height_map(
     points_world: torch.Tensor,
     points_valid: torch.Tensor,

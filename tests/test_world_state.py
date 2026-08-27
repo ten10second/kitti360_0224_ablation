@@ -269,8 +269,60 @@ def test_ground_measurement_encoder_support_follows_vggt_gates():
 
     oob = measure(torch.full((1, 2, size, size), 100.0), torch.full((1, 2, size, size), 0.9))
     assert not bool(oob.support.any()), "depth beyond the gate bound must empty the support"
+    beyond_range = measure(torch.full((1, 2, size, size), 30.0), torch.full((1, 2, size, size), 0.9))
+    assert not bool(beyond_range.support.any()), \
+        "depth beyond reliable_range_m is skyline-contaminated and must not write"
     lowconf = measure(torch.full((1, 2, size, size), 2.0), torch.full((1, 2, size, size), 0.1))
     assert not bool(lowconf.support.any()), "confidence below the gate must empty the support"
+
+
+def test_ground_height_quantile_keeps_ground_envelope():
+    """A BEV cell mixes road, facades, canopies and stray far depths; the
+    column MEAN was measured +8.6 m high at range — the low quantile must
+    keep the ground cluster."""
+    from world3d.unified_bev.geometry import ground_height_quantile
+
+    size, res = 4, 0.5
+    points = torch.tensor([[
+        # cell (0,0): half road (122) half canopy (128), true road 120+2 bias
+        [[0.25, 0.25, 122.0], [0.25, 0.25, 122.0], [0.25, 0.25, 128.0], [0.25, 0.25, 128.0]],
+        # cell (1,2): road x3, canopy x1
+        [[1.25, 0.25, 122.0], [1.25, 0.25, 122.0], [1.25, 0.25, 122.0], [1.25, 0.25, 128.0]],
+    ]])
+    valid = torch.ones(1, 2, 4, dtype=torch.bool)
+    z_ground, count = ground_height_quantile(
+        points, valid, torch.zeros(1, 2), res, size, size, quantile=0.15,
+    )
+    assert abs(float(z_ground[0, 0, 0, 0]) - 122.0) < 1e-6, "mean would read 125.0"
+    assert abs(float(z_ground[0, 0, 0, 2]) - 122.0) < 1e-6  # cell (row 0, col 2)
+    assert int(count[0, 0, 0, 0]) == 4
+    assert float(z_ground[0, 0, 3, 3]) == 0.0  # empty cell stays zero
+
+
+def test_measurement_ground_field_anchor_removes_local_bias():
+    """The camera rig's world Z minus the calibrated camera height anchors
+    the chunk's absolute ground: a uniform VGGT ground bias must cancel,
+    and the anchor stays inside this measurement (never a global offset)."""
+    import numpy as np
+    from world3d.unified_bev.state_models import GroundMeasurementEncoder
+
+    size, res = 8, 0.5
+    fx = 8.0
+    K = torch.tensor([[fx, 0, 3.5], [0, fx, 3.5], [0, 0, 1.0]])
+    T = torch.eye(4)
+    # camera looking straight down from 121.75; true road at 120.0
+    T[:3, :3] = torch.tensor([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+    T[0, 3], T[1, 3], T[2, 3] = 2.0, 2.0, 121.75
+    depth = torch.full((1, 1, size, size), 3.75)  # -> world z = 118 (uniform -2 m bias)
+    conf = torch.full((1, 1, size, size), 0.9)
+    enc = GroundMeasurementEncoder(latent_channels=8, bev_height=size, bev_width=size)
+    h_rel, support, anchor = enc.ground_field(
+        depth, conf, K.view(1, 1, 3, 3), T.view(1, 1, 4, 4),
+        torch.zeros(1, 2), res, torch.tensor([[120.0]]),
+    )
+    assert abs(float(anchor) - (-2.0)) < 1e-4, "anchor must measure the local VGGT bias"
+    assert bool(support.any())
+    assert float(h_rel[support].abs().max()) < 1e-4, "anchored ground must read datum-relative 0"
 
 
 def test_world_vggt_cache_identity_and_assembly():

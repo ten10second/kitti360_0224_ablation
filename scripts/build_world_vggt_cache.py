@@ -122,12 +122,14 @@ def main():
             stale = [k for k, v in header.items() if existing.get(k) != v]
             if stale:
                 raise RuntimeError(f"{dst} is stale on {stale}; use a fresh output directory")
-            have = {int(k) for k in existing.get("chunks", {})}
+            # saved keys are strings; normalise to int so sorted() never sees
+            # a mixed-key dict when resuming a partially built scene
+            chunks = {int(k): v for k, v in existing.get("chunks", {}).items()}
+            have = set(chunks)
             need = {int(c["chunk_index"]) for c in blob["chunk_table"]}
             if need <= have:
                 print(f"[world-vggt] {scene_id} already complete ({len(have)} chunks)", flush=True)
                 continue
-            chunks = existing["chunks"]
         else:
             chunks = {}
         if row["drive"] not in recs_by_drive:

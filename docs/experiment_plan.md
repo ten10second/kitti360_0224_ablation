@@ -35,7 +35,7 @@ KITTI-360 没有 UAV，只能评 **车稍后会开到、现在还没开到** 的
 | DINOv2-ViT-B/14 | 从 south-up 卫星 BEV 抽 patch 特征（resize 到 224，ImageNet 归一化） | 冻 |
 | `bilinear_splat` | 世界 XY → BEV 格子 | 不学 |
 | Stage A readers（height / density / depth） | 定义 \(Z\) 可读几何 | 先训后冻；Stage B 中 depth **不反传** |
-| `GroundMeasurementEncoder` | VGGT depth/conf + RGB + 标定位姿 → BEV 测量 \(G_t, M_t\) | **训**（单实例，两链共享同一 \(G_t\)；两链损失共同更新） |
+| `GroundMeasurementEncoder` | VGGT depth/conf + RGB + 标定位姿 → BEV 测量 \(G_t, M_t\)：**可靠距离门（≤25 m）+ 每格低分位地面包络 + 相机位姿 z 锚定（1.75 m 标定）**；近域外不写、前方等到达 | **训**（单实例，两链共享同一 \(G_t\)；两链损失共同更新） |
 | 卫星 write head | DINO 特征 (+ 固定 XY 编码) \(\to Z_0\) | **训**（小投影/卷积，不训 DINO） |
 | XY write head | 零特征 + 同一固定 XY 编码走同一 write-head 结构 | **训**（与卫星 write head 容量对齐） |
 | updater \(U\) | \(Z_{t-1},G_t,M_t\to Z_t\) | **训**（单实例，两链共享） |
@@ -171,3 +171,5 @@ Loss：
 - 训新的几何基础模型或视频 world model  
 - RGB 当主几何证据  
 - VLA / planning（最多作为后续下游，不进 v1）
+- **状态级单一全局高度 offset**（2026-08-27 校正探针：残差是坡度主导 75–81 m/km，完美标量的上限也只有 ahead 3.67→3.24 m；要标定必须是缓变坡度，另议）
+- **用 VGGT BEV 列均值高度做全局校准**（远距列均值被高空内容系统性污染：抬升/近格 +0.0/+1.7 m、>20 m 路面 +8.6 m、corr(误差,距离)=+0.66，估计的 offset 符号都会反；测量侧若要可靠的格子高度须改低分位数地面包络，另议）

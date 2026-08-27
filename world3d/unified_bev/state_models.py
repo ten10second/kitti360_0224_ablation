@@ -14,7 +14,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .geometry import bilinear_splat, height_statistics
+from .geometry import bilinear_splat, ground_height_quantile, height_statistics
 from .models import (
     ColumnFieldDecoder,
     GroundDenseBEVEncoder,
@@ -273,6 +273,21 @@ class GroundMeasurementEncoder(nn.Module):
 
     Height features are ``world_z - z_datum``, never a per-chunk quantile.
     Support/confidence come from geometry evidence, not free attention.
+
+    Height statistic (2026-08-27 redesign, measured on the held-out
+    descending scene): the previous column MEAN of splatted z mixed road,
+    facades, canopies and stray far depths, and was +8.6 m high on road
+    cells beyond 20 m (corr(err, distance)=+0.66).  Now:
+
+    - reliable_range_m: pixels farther than this are skyline-contaminated
+      and excluded entirely — the chunk writes only the region it reliably
+      covers; ahead regions wait for arrival (persistent-state semantics)
+    - ground_quantile: per-cell LOW quantile of world Z (ground envelope),
+      never the mean
+    - camera_height_above_road_m (calibrated 1.75 m, median of 21 train
+      scenes): the camera rig's world Z minus this anchors the chunk's
+      absolute ground level; the residual VGGT-vs-anchor offset is removed
+      locally per chunk (never applied globally)
     """
 
     def __init__(
@@ -284,6 +299,9 @@ class GroundMeasurementEncoder(nn.Module):
         conf_threshold: float = 0.3,
         min_depth_m: float = 0.5,
         max_depth_m: float = 60.0,
+        reliable_range_m: float = 25.0,
+        ground_quantile: float = 0.15,
+        camera_height_above_road_m: float = 1.75,
     ):
         super().__init__()
         self.lift = GroundDenseBEVEncoder(
@@ -296,6 +314,57 @@ class GroundMeasurementEncoder(nn.Module):
         self.conf_threshold = conf_threshold
         self.min_depth_m = min_depth_m
         self.max_depth_m = max_depth_m
+        self.reliable_range_m = float(reliable_range_m)
+        self.ground_quantile = float(ground_quantile)
+        self.camera_height_above_road_m = float(camera_height_above_road_m)
+
+    def _gate(self, dense_depth: torch.Tensor, dense_conf: torch.Tensor) -> torch.Tensor:
+        depth = torch.nan_to_num(dense_depth.float(), nan=0.0, posinf=0.0, neginf=0.0)
+        conf = torch.nan_to_num(dense_conf.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
+        gate = (
+            (conf > self.conf_threshold)
+            & (depth > self.min_depth_m)
+            & (depth < self.max_depth_m)
+            & (depth <= self.reliable_range_m)
+        )
+        return gate, depth
+
+    def ground_field(
+        self,
+        dense_depth: torch.Tensor,
+        dense_conf: torch.Tensor,
+        K: torch.Tensor,
+        T_world_cam: torch.Tensor,
+        origin_xy: torch.Tensor,
+        resolution_m: float,
+        z_datum_m: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Datum-relative ground-envelope height of one chunk's measurement.
+
+        Returns ``(h_rel [B,1,H,W], support [B,1,H,W] bool, anchor_offset_m)``.
+        The anchor removes the chunk-LOCAL VGGT ground bias against the
+        camera-rig reference; it is applied inside this measurement only and
+        must never become a state-level global offset (experiment_plan §8).
+        """
+        B, N, H, W = dense_depth.shape
+        gate, depth = self._gate(dense_depth, dense_conf)
+        pts = unproject_dense(depth, K, T_world_cam).view(B, N, H * W, 3)
+        z_ground, count = ground_height_quantile(
+            pts, gate.view(B, N, H * W), origin_xy, resolution_m,
+            self.bev_height, self.bev_width, quantile=self.ground_quantile,
+        )
+        support = count > 0
+        road_ref = (
+            torch.median(T_world_cam[..., 2, 3].float().reshape(-1))
+            - self.camera_height_above_road_m
+        )
+        if bool(support.any()):
+            anchor = z_ground[support].median() - road_ref
+        else:
+            anchor = z_ground.new_zeros(())
+        datum = z_datum_m.view(B, 1, 1, 1).to(z_ground.dtype)
+        h_rel = (z_ground - anchor - datum) * support.to(z_ground.dtype)
+        return h_rel, support, anchor
 
     def forward(
         self,
@@ -312,35 +381,26 @@ class GroundMeasurementEncoder(nn.Module):
     ) -> GroundMeasurement:
         assert_no_supervision_leak(kwargs, context="GroundMeasurementEncoder")
         B, N, _, H, W = images.shape
-        dense_depth = torch.nan_to_num(dense_depth.float(), nan=0.0, posinf=0.0, neginf=0.0)
-        dense_conf = torch.nan_to_num(dense_conf.float(), nan=0.0, posinf=0.0, neginf=0.0).clamp(min=0.0)
+        gate, depth = self._gate(dense_depth, dense_conf)
+        h_rel, support, _anchor = self.ground_field(
+            dense_depth, dense_conf, K, T_world_cam, origin_xy, resolution_m, z_datum_m,
+        )
         feat = self.lift.image_encoder(images.reshape(B * N, 3, H, W))
         if feat.shape[-2:] != (H, W):
             feat = F.interpolate(feat, size=(H, W), mode="bilinear", align_corners=False)
         C = feat.shape[1]
         feat = feat.view(B, N, C, H * W).transpose(2, 3)
-        pts = unproject_dense(dense_depth, K, T_world_cam).view(B, N, H * W, 3)
-        gate = (
-            (dense_conf > self.conf_threshold)
-            & (dense_depth > self.min_depth_m)
-            & (dense_depth < self.max_depth_m)
-        ).view(B, N, H * W)
+        pts = unproject_dense(depth, K, T_world_cam).view(B, N, H * W, 3)
+        gate = gate.view(B, N, H * W)
         bev, count = bilinear_splat(
             feat, pts[..., :2], gate,
             origin_xy=origin_xy, resolution_m=resolution_m,
             height=self.bev_height, width=self.bev_width,
         )
-        z_abs, _ = bilinear_splat(
-            pts[..., 2:3], pts[..., :2], gate,
-            origin_xy=origin_xy, resolution_m=resolution_m,
-            height=self.bev_height, width=self.bev_width,
-        )
-        datum = z_datum_m.view(B, 1, 1, 1).to(z_abs.dtype)
-        h_rel = (z_abs - datum) * (count > 0).to(z_abs.dtype)
         _, h_var = height_statistics(
             pts, gate, origin_xy, resolution_m, self.bev_height, self.bev_width,
         )
-        coverage = (count > 0).to(bev.dtype)
+        coverage = support.to(bev.dtype)
         x = torch.cat([
             bev, coverage, h_rel, h_var * coverage, (count + 1).log() / 5.0,
         ], dim=1)
@@ -353,7 +413,6 @@ class GroundMeasurementEncoder(nn.Module):
             origin_xy=origin_xy, resolution_m=resolution_m,
             height=self.bev_height, width=self.bev_width,
         )
-        support = coverage.bool()
         confidence = torch.where(support, conf_splat.clamp(0.0, 1.0), torch.zeros_like(conf_splat))
         meas = GroundMeasurement(z, support, confidence, int(chunk_index))
         meas.validate(SceneTileSpec(

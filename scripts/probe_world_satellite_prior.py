@@ -117,6 +117,10 @@ def evaluate(head, inputs, targets, masks, scratch_encoder=None):
         out[region] = {
             "height_mae": float(h_err.abs().mean()),
             "height_bias": float(h_err.mean()),
+            # calibration-removed errors: how much map SHAPE remains after
+            # stripping the scene-level offset satellite cannot know
+            "height_centered_mae": float((h_err - h_err.mean()).abs().mean()),
+            "height_median_centered_mae": float((h_err - h_err.median()).abs().mean()),
             "height_pearson": pearson,
             "density_mae": float(d_err.abs().mean()),
             "cells": int(m.sum()),
@@ -136,6 +140,7 @@ def main():
     args = ap.parse_args()
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
     torch.manual_seed(args.seed)
+    np.random.seed(args.seed)  # scene-order shuffles must follow --seed too
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -231,11 +236,14 @@ def main():
             vals = [r[region][key] for r in rows if r[region]]
             return float(np.mean(vals)) if vals else None
         print(f"[e0:{arm}] TRAIN fit   valid: hMAE={_m(tr, 'height_mae', 'valid'):.3f} "
-              f"r={_m(tr, 'height_pearson', 'valid'):.3f}")
+              f"r={_m(tr, 'height_pearson', 'valid'):.3f} "
+              f"centered={_m(tr, 'height_centered_mae', 'valid'):.3f}")
         print(f"[e0:{arm}] HELD-OUT    valid: hMAE={_m(ho, 'height_mae', 'valid'):.3f} "
               f"r={_m(ho, 'height_pearson', 'valid'):.3f} | "
               f"route: hMAE={_m(ho, 'height_mae', 'route'):.3f} "
-              f"r={_m(ho, 'height_pearson', 'route'):.3f}", flush=True)
+              f"r={_m(ho, 'height_pearson', 'route'):.3f} | "
+              f"valid centered={_m(ho, 'height_centered_mae', 'valid'):.3f} "
+              f"med-centered={_m(ho, 'height_median_centered_mae', 'valid'):.3f}", flush=True)
 
     (out / "summary.json").write_text(json.dumps(results, indent=2))
     print(f"[e0] wrote {out / 'summary.json'}")
