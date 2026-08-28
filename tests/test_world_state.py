@@ -240,6 +240,40 @@ def test_world_height_targets_survive_absolute_elevation():
     assert h[5, 4] == 0.0                           # unknown cells reset to zero
 
 
+def test_semantics_surface_selection_and_policy():
+    """v3 ground truth: label-driven layer choice (P0-audited), quality
+    filters, and the instance coding contract."""
+    import numpy as np
+    from world3d.unified_bev.semantics import (
+        GROUND_IDS,
+        TOP_IDS,
+        filter_points,
+        label_policy_hash,
+        select_surface_height,
+    )
+
+    # mixed cell (mostly road + some building): top share >= 15% -> read roof
+    z = np.array([120.0, 120.1, 124.0, 124.2, 124.1, 124.3, 130.0])
+    lab = np.array([7, 7, 11, 11, 11, 21, 41])
+    assert abs(select_surface_height(z, lab) - 124.285) < 1e-2  # p95 of TOP points (interpolated)
+    # ground-dominated: same cell without buildings -> road median
+    assert abs(select_surface_height(np.array([120.0, 120.2]), np.array([7, 7])) - 120.1) < 1e-9
+    assert select_surface_height(np.array([120.0, 126.0, 121.0]),
+                                 np.array([7, 21, 21])) >= 125.0
+
+    # policy: top and ground sets disjoint; ignore ids vote nowhere
+    assert not (GROUND_IDS & TOP_IDS)
+
+    # instance coding contract: stuff classes carry classInstanceID == 0
+    sem = np.array([7, 11, 26])
+    inst = np.array([7000, 11062, 26683])
+    assert ((inst // 1000) == sem).all()
+    assert int((inst % 1000 == 0).sum()) == 1  # road is stuff; building/person are things
+
+    # hash is stable — target identity depends on it
+    assert label_policy_hash() == label_policy_hash()
+
+
 def test_ground_measurement_encoder_support_follows_vggt_gates():
     """The measurement's support must come from VGGT conf/depth gates on the
     calibrated unprojection — not from LiDAR supervision masks."""
@@ -446,9 +480,9 @@ def test_supervised_region_excludes_unlabelled_measurement_cells():
 
 def test_world_target_version_contract():
     """The version strings must move whenever the target math or datum policy
-    changes; a stale checkpoint from v1 must fail validation, not pass."""
+    changes; a stale checkpoint from an older target generation must fail."""
     from world3d.unified_bev.world_state import WORLD_TARGET_VERSION, Z_DATUM_POLICY
-    assert WORLD_TARGET_VERSION == "surface_p90_relative_height_clipped_v2"
+    assert WORLD_TARGET_VERSION == "official_semantics_surface_v3"
     assert Z_DATUM_POLICY == "first_chunk_lidar_optical_center_world_z_median_v1"
 
 

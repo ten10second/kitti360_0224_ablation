@@ -305,3 +305,20 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 - **实测（0003 chunk1，旧→新）**：support 28,127→7,831（只写可靠域）；写入格内中位偏差 **+6.87→+1.09 m**、MAE **7.70→2.26 m**；近(<20m)中位 +0.67/MAE 1.21；anchor=−0.79 m（本 chunk VGGT 地面整体偏低被扣除）。与 LiDAR 标签 overlap 0.73→0.84（可靠域与标签对齐更好）。
 - **链路**：assimilation 20 步 + eval aligned 全通；`outside_latent_max=0.0` 精确保持不变；`update_support_cells` 7,831 落盘可审计。
 - **测试**：新增 ground_height_quantile 包络（均值会读 125、分位数读 122）、ground_field 锚定（齐次位姿取 z 的 [3,3]→[2,3] bug 在测试中暴露并修复）、可靠距离门（depth=30>25m → support 空）三测试；41/41 通过。
+
+### 2026-08-27 — world_target_v3：官方语义语义云接管静态真值（用户拍板直接上 V3）
+
+- **前提确认**：官方 static PLY 与我们的世界系完全一致——0003 tile 直接套 origin bin 命中 166 万点；17,831 个共性格 v2-p90 vs 官方-p90 中位差 −0.033 m、MAD 0.09 m（无镜像/单位/datum 错位）；instance 编码 `semantic*1000+classInstanceID` 在 17M 点上 100% 成立（stuff 类 XX000、thing 类带个体号）。
+- **P0 审计（分歧按成分分类）**：ground-dominated 格（top<15%）v2 与官方几乎完美（median +1.2cm、偏低>1m 仅 0.02%）；**top-mixed 格 42.6% 偏低 >1m**（raw 视角遮挡采不全顶面）；车辆类污染 2.2–2.6%。选层规则由此实证：ground 主导取地面 p50，含 TOP(≥15%) 取 TOP 点 p95。
+- **实现（world3d/unified_bev/semantics.py 新模块）**：PLY 解析器（static/dynamic 两套 header 自动识别）、LABEL_POLICY（GROUND/TOP/IGNORE/DYNAMIC 四组常量 + label_policy_hash + 版本串 inferred_geometry_colour_v1，待 labels.py 校验）、质量过滤（conf≥0.5 ∧ visible=1 ∧ 白名单类）、`select_surface_height` 成分感知选层、`bin_semantic_surface` 出 height_world_z/semantic_top/count 三图。
+- **builder 重构**：`build_scene_blob` 真值源换官方 static 云（按 anchor_fid+margin 选覆盖段），raw scan 只保留 chunk_support 的职责（时间轴证据）；blob 新增 `semantics{label_policy_hash,conf_threshold,root}` 与 `semantic_top` 图；`WORLD_TARGET_VERSION="official_semantics_surface_v3"`。
+- **抓到并修复一个回归**：初版把 valid 判断放在 `height_minus_datum` 之后（NaN 已被重置为 0）→ valid=全图 4 万、25k 空格假高度 0（伪负回归）。改为 `valid = ~isnan(packed.height_world_z)` 后：valid=14,827（v2 的 61%，监督变严变少是预期代价）、共性格 median diff +0.012/MAD 0.084、car 残渣全部消失（v3 HIGHER>1m 即"raw 污染被删"10.7% + "真屋顶恢复"<1m 占 2.2%）。
+- **验证**：42/42 单测（新增 surface selection/instance coding/policy hash 测试）；dataset 加载 OK（高度 [−7.74,9.20] 连续分布、12,107 unique）；旧 v2 缓存按版本绑定自动被拒；22 train + 1 test scene 全量重建（train 0000×21+0006×1，skip 2；valid 中位 9,216 ≫ E 协议 256 门槛）；VGGT 缓存全重建（176+8 chunks、100% vehicle_motion、0 泄漏）；端到端 smoke（interface→assim→eval aligned）全通，outside_latent_max=0.0 保持。
+- **待办**：labels.py 到手后校验 LABEL_POLICY（重点：static 云实测无一 car/person 点出现，26 号在 dynamic 是 carrier）→ 视需要 bump LABEL_POLICY_VERSION 重跑 targets；正式长训练（interface 5000 步 + shared_assimilation）在此 target 上启动。
+
+### 2026-08-28 — LABEL_POLICY 官方校验完成：三处错判修正（v2 名单）
+
+- **labels.py 已拉取校验**（46 个官方标签）。大类全对：7=road/8=sidewalk/9=parking/22=terrain/11=building/21=vegetation/17=pole/24=person/**26=car**（此前悬案定案：static 云实测无 26 点，停车从未进入语义云）。
+- **三处错判修正**：①id 12 实为 **wall**（非"低矮地面"）→ 从 GROUND 移入 TOP（竖直结构投顶面票，原配置会让墙点拉高地面中位）；②id 6 实为官方特有 **ground** 类（非 fence）→ 从 TOP 移入 GROUND；③id 34 实为 **garage**（位置对，名字更正）、13=fence。补充归类：10=rail track、14=guard rail 进 TOP；20=traffic sign、16=tunnel 进 IGNORE；DYNAMIC_CARRIERS 扩为官方全动态族 {24,25,26,27,29,30,32,33}。
+- `LABEL_POLICY_VERSION → official_labels_verified_v2`（label_policy_hash 随之变化 → 现有 v3 blob 按身份链自动可判失效，需用新名单重建 targets+重训——当前 overnight 链跑的是 v1 名单产物，其结果定位为"pre-verification 基线"，校验后差异若显著再决定是否重跑）。
+- 42/42 测试通过；formal 链健康（interface step 1680/5000，loss 2.66→0.36，GPU 96%）。

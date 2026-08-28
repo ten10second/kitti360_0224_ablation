@@ -26,10 +26,10 @@ PROVENANCE_ENUM = {
 }
 
 WORLD_STATE_SCHEMA_VERSION = "world_state_v1"
-# v2: the physical clip moved into the datum-relative domain (v1 clipped
-# absolute map altitude ~120 m and collapsed the tile to one constant), and
-# the datum is causal: the first chunk's LiDAR optical centers only.
-WORLD_TARGET_VERSION = "surface_p90_relative_height_clipped_v2"
+# v3: targets come from the official static-semantics accumulation
+# (dynamic split off, per-point labels, confidence) with label-policy-driven
+# surface selection; raw scans keep only the per-chunk support masks.
+WORLD_TARGET_VERSION = "official_semantics_surface_v3"
 Z_DATUM_POLICY = "first_chunk_lidar_optical_center_world_z_median_v1"
 C_INIT = 0.25
 CHUNKING_VERSION = "route_chunk_v1"

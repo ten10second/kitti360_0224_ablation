@@ -11,6 +11,15 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from .semantics import (
+    bin_semantic_surface,
+    concatenate_semantics,
+    filter_points as filter_semantics_points,
+    label_policy_hash,
+    ALLOWED_SEMANTIC_IDS,
+    SEMANTICS_CONF_THRESHOLD,
+    SEMANTICS_ROOT_DEFAULT,
+)
 from .chunks import RouteChunk, build_route_chunks, core_member_index, select_chunk_frames
 from .data import (
     SAT_M_PER_PX,
@@ -161,7 +170,7 @@ def build_scene_blob(
     origin = proposal["origin_xy"]
     sat_center = proposal["sat_center_xy"]
     anchor = proposal["anchor"]
-    # Causal datum: FIRST chunk's LiDAR optical centers only; the whole-scene
+    # Causal datum: FIRST chunk's camera-road reference only; the whole-scene
     # median used future vehicle positions at t=0.
     z_datum = first_chunk_datum_z(window, by_fid)
     all_points = []
@@ -174,13 +183,23 @@ def build_scene_blob(
             pts_c.append(pts)
             all_points.append(pts)
         chunk_points.append(np.concatenate(pts_c, axis=0) if pts_c else np.zeros((0, 3)))
-    packed = accumulate_lidar_surface(
-        np.concatenate(all_points, axis=0) if all_points else np.zeros((0, 3)),
-        origin, tile_size_m=tile_size_m, resolution_m=resolution_m,
+
+    # v3 truth: official static-semantics accumulation (dynamic objects and
+    # low-confidence points already excluded by filter_semantics_points).
+    # Raw scans keep ONE job: the per-chunk support masks (temporal evidence
+    # of what the vehicle has seen), which no accumulation can provide.
+    sem_filtered = filter_semantics_points(
+        concatenate_semantics(SEMANTICS_ROOT_DEFAULT, anchor.drive, anchor.fid),
+        conf_threshold=SEMANTICS_CONF_THRESHOLD,
+        allowed_ids=ALLOWED_SEMANTIC_IDS,
     )
+    packed = bin_semantic_surface(
+        sem_filtered, origin, resolution_m=resolution_m, size=int(round(tile_size_m / resolution_m)),
+    )
+    valid = ~np.isnan(packed["height_world_z"])
     height = height_minus_datum(packed["height_world_z"], z_datum)
     density = log_normalize_density(packed["count"])
-    valid = packed["valid"]
+    semantic_top = packed["semantic_top"]
     size = height.shape[0]
     chunk_support = []
     for pts in chunk_points:
@@ -264,11 +283,17 @@ def build_scene_blob(
         "resolution_m": float(resolution_m),
         "chunking_version": CHUNKING_VERSION,
         "world_target_version": WORLD_TARGET_VERSION,
-        "dynamic_filter": "none",
+        "dynamic_filter": "official_semantics_excluded+label_policy",
+        "semantics": {
+            "label_policy_hash": label_policy_hash(),
+            "conf_threshold": SEMANTICS_CONF_THRESHOLD,
+            "root": SEMANTICS_ROOT_DEFAULT,
+        },
         "satellite_bev": satellite_bev,
         "height": torch.from_numpy(height).unsqueeze(0),
         "density": torch.from_numpy(density).unsqueeze(0),
         "world_valid": torch.from_numpy(valid).unsqueeze(0),
+        "semantic_top": torch.from_numpy(semantic_top).unsqueeze(0),
         "count": torch.from_numpy(packed["count"].astype(np.int32)).unsqueeze(0),
         "chunk_lidar_support": torch.from_numpy(chunk_support_np).unsqueeze(1),
         "chunk_table": table,
