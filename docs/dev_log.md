@@ -322,3 +322,11 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 - **三处错判修正**：①id 12 实为 **wall**（非"低矮地面"）→ 从 GROUND 移入 TOP（竖直结构投顶面票，原配置会让墙点拉高地面中位）；②id 6 实为官方特有 **ground** 类（非 fence）→ 从 TOP 移入 GROUND；③id 34 实为 **garage**（位置对，名字更正）、13=fence。补充归类：10=rail track、14=guard rail 进 TOP；20=traffic sign、16=tunnel 进 IGNORE；DYNAMIC_CARRIERS 扩为官方全动态族 {24,25,26,27,29,30,32,33}。
 - `LABEL_POLICY_VERSION → official_labels_verified_v2`（label_policy_hash 随之变化 → 现有 v3 blob 按身份链自动可判失效，需用新名单重建 targets+重训——当前 overnight 链跑的是 v1 名单产物，其结果定位为"pre-verification 基线"，校验后差异若显著再决定是否重跑）。
 - 42/42 测试通过；formal 链健康（interface step 1680/5000，loss 2.66→0.36，GPU 96%）。
+
+### 2026-08-28 — 清理第一、二组退役代码（frame 链 + ICASSP27 试点）
+
+- **第一组（旧 frame unified-BEV 链，13 文件）**：`run_unified_bev_claim_probe.sh`、`train_unified_bev_stage_a/b.py`、`eval_unified_bev_probe.py`、`consistency_unified_bev_multichain.py`、`build_unified_bev_cache.py`、`check_unified_bev_replay.py`、`compare_unified_bev_paired.py`、`smoke_unified_bev.py`、`diag_vggt_gate.py`、`export_vggt_metric_pointmap.py`、`render_vggt_pointmap_views.py`、`visualize_dense_reconstruction.py`，及 `configs/unified_bev_stage_a/b.yaml`（无 reader）。
+- **重要修正**：`build_vggt_street_cache.py` 从删除清单撤回——`build_world_vggt_cache.py`（主链）import 其 `run_joint_subset`（VGGT 联合前向），`tests/test_unified_bev.py` 4 处 import `estimate_motion_metric_scale`；它是活的共享工具模块。
+- **第二组（ICASSP27 试点）**：`icassp27_verify/` 整目录（VERIFY_LOG/REFACTOR_NOTES/out 可视化）、`world3d/models/icassp27_predictor.py`、`world3d/train/train_icassp27.py`、`world3d/data/kitti360_tuple_dataset.py`、`configs/icassp27_*.yaml` 两个。各 `__init__.py` 均为纯注释，无 import 断裂。
+- **验证**：`compileall`（scripts/、world3d/unified_bev/、tests/）通过；余下 2 条 shell 链 `bash -n` 通过；14 个活脚本模块级 import 全 OK（CPU，隐藏 GPU 不干扰 formal 链）；42/42 单测通过（test_unified_bev 21 + test_world_state 21）。
+- **规模**：共删 64 个 tracked 文件、5965 行；未 commit，可从 git 历史恢复。`models/`、`metrics/`、`utils/`、`datasets/`、`ckpts/`、`world3d` 非核心子包等第三、四组候选未动。
