@@ -82,6 +82,10 @@ def main():
     ap.add_argument("--shift_m", type=float, default=5.0)
     ap.add_argument("--records_out", default="runs/world_state_eval.jsonl")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dgm_tiles", default=None,
+                    help="BW DGM1 zip dir; enables the two-tier DGM ground "
+                         "anchor (must match the trained checkpoint)")
+    ap.add_argument("--kitti360_root", default="/media/shizhm/sda1/KITTI-360")
     args = ap.parse_args()
     device = torch.device(args.device if args.device != "cuda" or torch.cuda.is_available() else "cpu")
 
@@ -112,6 +116,12 @@ def main():
     for m in (world_enc, height_r, density_r, depth_r, sat_init, xy_init, updater, meas_enc):
         freeze_module(m)
     vggt_caches: dict = {}
+    dgm_anchors: dict = {}
+    dgm_tile_set = None
+    if args.dgm_tiles is not None:
+        from world3d.unified_bev.dgm import DgmAnchor, DgmTileSet, anchor_tile_tensor
+        dgm_tile_set = DgmTileSet.from_dir(Path(args.dgm_tiles))
+        print(f"[world-eval] DGM anchor enabled: {len(dgm_tile_set.rasters)} tiles")
     if args.vggt_cache is None:
         print("[world-eval] WARNING: no --vggt_cache; trajectories use the "
               "LiDAR teacher measurement fallback (diagnostic only)")
@@ -143,6 +153,7 @@ def main():
                 state = sat_init(sat, spec)
 
             t_chunks = chunk_support.shape[1]
+            dgm_tile = None
             if args.vggt_cache is not None:
                 scene_id = blob["scene_id"]
                 if scene_id not in vggt_caches:
@@ -150,6 +161,14 @@ def main():
                         args.vggt_cache, scene_id,
                         str(blob["world_target_version"]), str(blob["world_target_hash"]),
                     )
+                if dgm_tile_set is not None:
+                    if scene_id not in dgm_anchors:
+                        anchor = DgmAnchor.from_blob(blob, dgm_tile_set, Path(args.kitti360_root))
+                        dgm_anchors[scene_id] = anchor_tile_tensor(
+                            anchor, inputs.origin_xy[0].numpy(), ds.bev_size,
+                            float(spec.resolution_m), device,
+                        )
+                    dgm_tile = dgm_anchors[scene_id]
             snapshots = {0: state}
             meas_list = []
             if args.control not in ("sat_only", "world_upper"):
@@ -164,6 +183,8 @@ def main():
                             chunk_index=t + 1,
                             query_fid=int(blob["chunk_table"][t]["core_fid"]),
                             detach=True,
+                            dgm_abs_z=None if dgm_tile is None else dgm_tile[0],
+                            dgm_valid=None if dgm_tile is None else dgm_tile[1],
                         )
                     else:
                         support = chunk_support[:, t]
@@ -224,6 +245,10 @@ def main():
                     row["outside_latent_max"] = float(
                         (st.latent - prev.latent).abs().masked_select(outside.expand_as(st.latent)).max().item()
                     ) if outside.any() else 0.0
+                    if getattr(meas, "dgm_qa", None):
+                        row["dgm_status"] = str(meas.dgm_qa.get("status"))
+                        row["dgm_mad_m"] = _finite(float(meas.dgm_qa.get("dgm_mad_m", float("nan"))))
+                        row["dgm_tier2_cells"] = int(meas.dgm_qa.get("n_tier2", 0))
                     if 1 in snapshots and t > 1:
                         m1 = meas_supports[0] if meas_supports else chunk_support[:, 0]
                         row["forget_1_to_t_height"] = _finite(

@@ -10,7 +10,7 @@ invalidates the cache instead of silently mixing contracts.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 
@@ -89,6 +89,8 @@ def chunk_measurement_from_cache(
     chunk_index: int,
     query_fid: int,
     detach: bool = False,
+    dgm_abs_z: Optional[torch.Tensor] = None,
+    dgm_valid: Optional[torch.Tensor] = None,
 ) -> GroundMeasurement:
     """Turn one cached chunk entry into a GroundMeasurement.
 
@@ -97,6 +99,9 @@ def chunk_measurement_from_cache(
     replay); the frozen VGGT side never carries gradients either way.
     ``query_fid`` is the chunk's depth-query core frame; the entry must be
     isolated from it (``assert_query_isolation``).
+    ``dgm_abs_z``/``dgm_valid`` are the scene's pre-sampled DGM tile
+    (absolute DHHN2016 heights on the BEV grid); without them the encoder
+    uses the legacy camera-rig median anchor.
     """
     assert_query_isolation(entry, query_fid)
 
@@ -120,6 +125,8 @@ def chunk_measurement_from_cache(
         resolution_m=float(resolution_m),
         z_datum_m=z_datum_m,
         chunk_index=int(chunk_index),
+        dgm_abs_z=dgm_abs_z.to(device) if dgm_abs_z is not None else None,
+        dgm_valid=dgm_valid.to(device) if dgm_valid is not None else None,
     )
     if detach:
         measurement.latent = measurement.latent.detach()

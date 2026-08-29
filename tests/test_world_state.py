@@ -350,13 +350,127 @@ def test_measurement_ground_field_anchor_removes_local_bias():
     depth = torch.full((1, 1, size, size), 3.75)  # -> world z = 118 (uniform -2 m bias)
     conf = torch.full((1, 1, size, size), 0.9)
     enc = GroundMeasurementEncoder(latent_channels=8, bev_height=size, bev_width=size)
-    h_rel, support, anchor = enc.ground_field(
+    h_rel, support, qa = enc.ground_field(
         depth, conf, K.view(1, 1, 3, 3), T.view(1, 1, 4, 4),
         torch.zeros(1, 2), res, torch.tensor([[120.0]]),
     )
-    assert abs(float(anchor) - (-2.0)) < 1e-4, "anchor must measure the local VGGT bias"
+    assert qa["status"] == "legacy"
+    assert abs(float(qa["anchor_m"]) - (-2.0)) < 1e-4, "anchor must measure the local VGGT bias"
     assert bool(support.any())
     assert float(h_rel[support].abs().max()) < 1e-4, "anchored ground must read datum-relative 0"
+
+
+def test_ground_field_dgm_two_tier_anchors_far_cells():
+    """Far cells (only 15-25 m points) must take the surveyed DGM terrain
+    (dgm + delta), not the VGGT envelope that is slope-biased out there;
+    trusted near cells keep the envelope centered on the DGM agreement."""
+    import numpy as np
+    from world3d.unified_bev.state_models import GroundMeasurementEncoder
+
+    size, res = 8, 0.5
+    fx = 8.0
+    K = torch.tensor([[fx, 0, 3.5], [0, fx, 3.5], [0, 0, 1.0]]).view(1, 1, 3, 3)
+    rot = torch.tensor([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+
+    def down_cam(x, y, z):
+        T = torch.eye(4)
+        T[:3, :3] = rot
+        T[0, 3], T[1, 3], T[2, 3] = x, y, z
+        return T.view(1, 1, 4, 4)
+
+    # view 1: near camera, depth 3.75 from 121.75 -> ground z = 118 everywhere
+    d1 = torch.full((1, 1, size, size), 3.75)
+    # view 2: far camera at z=140, depth 22 -> ground z = 118 too, footprint
+    # shifted right so some grid cells receive ONLY far (15-25 m) points
+    d2 = torch.full((1, 1, size, size), 22.0)
+    depth = torch.stack([d1.squeeze(1), d2.squeeze(1)], dim=1)
+    conf = torch.full((1, 2, size, size), 0.9)
+    T = torch.cat([down_cam(2.0, 2.0, 121.75), down_cam(5.5, 2.0, 140.0)], dim=1)
+    datum = torch.tensor([[120.0]])
+    origin = torch.zeros(1, 2)
+
+    # DGM: true terrain 118 with a 118.5 shelf at col 0 (all rows); trusted
+    # cells see dgm=118 -> delta=0, so tier2 cells must read 118.5 - 120
+    dgm = torch.full((1, 1, size, size), 118.0)
+    dgm[..., :, 0] = 118.5
+    dgm_valid = torch.ones(1, 1, size, size, dtype=torch.bool)
+
+    enc = GroundMeasurementEncoder(latent_channels=8, bev_height=size, bev_width=size,
+                                   dgm_min_trusted_cells=4)
+    h_rel, support, qa = enc.ground_field(
+        depth, conf, K, T, origin, res, datum, dgm_abs_z=dgm, dgm_valid=dgm_valid,
+    )
+    assert qa["status"] == "dgm", qa
+    assert float(qa["delta_m"]) < 0.05, qa
+    assert qa["n_tier2"] >= 1, "fixture must produce far-only cells"
+    vals = h_rel[0, 0][support[0, 0]]
+    shelf = (vals + 1.5).abs() < 1e-3   # dgm shelf + delta - datum
+    plain = (vals + 2.0).abs() < 1e-3   # envelope + delta - datum
+    assert int(shelf.sum()) == qa["n_tier2"], "tier2 cells must take dgm + delta"
+    assert int(plain.sum()) == int(support.sum()) - qa["n_tier2"]
+
+
+def test_ground_field_dgm_gate_falls_back_on_inconsistent_dgm():
+    """Non-constant LiDAR-vs-DGM disagreement (bridges, tile edges) beyond the
+    MAD gate must fall back to the legacy camera-rig anchor — never inject a
+    corrupted terrain shape into the measurement."""
+    import numpy as np
+    from world3d.unified_bev.state_models import GroundMeasurementEncoder
+
+    size, res = 8, 0.5
+    fx = 8.0
+    K = torch.tensor([[fx, 0, 3.5], [0, fx, 3.5], [0, 0, 1.0]])
+    T = torch.eye(4)
+    T[:3, :3] = torch.tensor([[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]])
+    T[0, 3], T[1, 3], T[2, 3] = 2.0, 2.0, 121.75
+    depth = torch.full((1, 1, size, size), 3.75)
+    conf = torch.full((1, 1, size, size), 0.9)
+    enc = GroundMeasurementEncoder(latent_channels=8, bev_height=size, bev_width=size,
+                                   dgm_min_trusted_cells=4)
+    generator = torch.Generator().manual_seed(0)
+    dgm = 118.0 + 8.0 * torch.rand(1, 1, size, size, generator=generator)  # ±8 m noise
+    dgm_valid = torch.ones(1, 1, size, size, dtype=torch.bool)
+    h_rel, support, qa = enc.ground_field(
+        depth, conf, K.view(1, 1, 3, 3), T.view(1, 1, 4, 4),
+        torch.zeros(1, 2), res, torch.tensor([[120.0]]),
+        dgm_abs_z=dgm, dgm_valid=dgm_valid,
+    )
+    assert qa["status"] == "fallback_mad", qa
+    assert float(h_rel[support].abs().max()) < 1e-4, "fallback must reproduce legacy anchoring"
+
+
+def test_dgm_tileset_and_anchor_sampling():
+    """Cell-center bilinear sampling of a synthetic raster and the world->UTM
+    affine fit must both be exact on linear ground."""
+    import numpy as np
+
+    from world3d.unified_bev.dgm import DgmAnchor, DgmTileSet, fit_world_to_utm
+
+    # raster value = 1000 + local cell-center easting + 10 * local northing;
+    # row 0 is the northernmost cell (sampler maps y_pix = 999.5 - local_n)
+    x = np.arange(1000)[None, :] + 0.5
+    r = np.arange(1000)[:, None]
+    raster = (1000 + x + 10.0 * (999.5 - r)).astype(np.float32)
+    tiles = DgmTileSet({(451, 5428): raster})
+    anchor = DgmAnchor(tiles, np.eye(2), np.zeros(2), 0.0, "test")
+    z, valid = anchor.sample_tile((451_002.0, 5_428_003.0), 8, 0.5)
+    assert bool(valid.all())
+    idx = np.arange(8)
+    local_e = 2.0 + (idx + 0.5) * 0.5     # easting inside tile 451
+    local_n = 3.0 + (idx + 0.5) * 0.5     # northing inside tile 5428
+    expect = 1000.0 + local_e[None, :] + 10.0 * local_n[:, None]
+    assert np.allclose(z, expect, atol=1e-3), "bilinear on a linear field must be exact"
+
+    # affine fit recovers a known rotation+scale+shift
+    rng = np.random.default_rng(0)
+    transform = np.array([[2.0, 0.5], [-0.25, 1.5]])
+    shift = np.array([451_000.0, 5_428_000.0])
+    src = rng.normal(0, 50, size=(200, 2))
+    dst = src @ transform + shift
+    fit_t, fit_off, rmse = fit_world_to_utm(src, dst)
+    assert rmse < 1e-8
+    assert np.allclose(fit_t, transform, atol=1e-8)
+    assert np.allclose(fit_off, shift, atol=1e-6)
 
 
 def test_world_vggt_cache_identity_and_assembly():
@@ -476,6 +590,34 @@ def test_supervised_region_excludes_unlabelled_measurement_cells():
     assert int((sup & ~valid).sum()) == 0
     assert int((sup & ~support).sum()) == 0
     assert int(sup.sum()) == int((support & valid).sum())
+
+
+def test_retention_mask_excludes_current_write_region():
+    """Consecutive chunk supports overlap the visited mask by 0.87-0.98 on real
+    routes; anchoring the full pre-chunk visited region would fight the current
+    write on almost every supervised cell (E3 mechanism diag 2026-08-28)."""
+    import torch
+    from world3d.unified_bev.world_state import retention_mask
+
+    chunk_support = torch.zeros(1, 3, 1, 6, 6, dtype=torch.bool)
+    chunk_support[:, 0, ..., :3, :] = True    # chunk 1: rows 0-2
+    chunk_support[:, 1, ..., 1:4, :] = True   # chunk 2: rows 1-3 (heavy overlap)
+    chunk_support[:, 2, ..., 3:, :] = True    # chunk 3: rows 3-5
+    current_supervised = torch.zeros(1, 1, 6, 6, dtype=torch.bool)
+    current_supervised[..., 2, 1:5] = True    # current write: row 2, partly old
+    m = retention_mask(chunk_support, 3, current_supervised)
+    assert int(m.sum()) > 0, "old-only cells must stay anchored"
+    # cells the current chunk supervises are never anchored, even if visited
+    assert int((m & current_supervised).sum()) == 0
+    assert bool(m[0, 0, 1, 0]) is True        # old visited, not rewritten
+    assert bool(m[0, 0, 4, 0]) is False       # never visited
+    # there is nothing to retain before the second chunk
+    try:
+        retention_mask(chunk_support, 1, current_supervised)
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
 
 
 def test_world_target_version_contract():

@@ -34,8 +34,8 @@ KITTI-360 没有 UAV，只能评 **车稍后会开到、现在还没开到** 的
 | VGGT | 把 12 m chunk（剔除查询帧）变成 \(G_t, M_t\) 的 depth/conf | 冻 |
 | DINOv2-ViT-B/14 | 从 south-up 卫星 BEV 抽 patch 特征（resize 到 224，ImageNet 归一化） | 冻 |
 | `bilinear_splat` | 世界 XY → BEV 格子 | 不学 |
-| Stage A readers（height / density / depth） | 定义 \(Z\) 可读几何 | 先训后冻；Stage B 中 depth **不反传** |
-| `GroundMeasurementEncoder` | VGGT depth/conf + RGB + 标定位姿 → BEV 测量 \(G_t, M_t\)：**可靠距离门（≤25 m）+ 每格低分位地面包络 + 相机位姿 z 锚定（1.75 m 标定）**；近域外不写、前方等到达 | **训**（单实例，两链共享同一 \(G_t\)；两链损失共同更新） |
+| Stage A readers（height / density / depth） | 定义 \(Z\) 可读几何 | 先训后冻；Stage B 中 reader 权重不更新，但 depth 读出作为状态一致性损失，梯度**穿过**冻结 reader 反传到 latent（2026-08-28 修订） |
+| `GroundMeasurementEncoder` | VGGT depth/conf + RGB + 标定位姿 → BEV 测量 \(G_t, M_t\)：**可靠距离门（≤25 m）+ 每格低分位地面包络 + 双层锚定（2026-08-29 修订）**——近距（≤15 m）格用 VGGT 包络、远距格锚定官方 DGM1 地形（逐 chunk 常数 Δ 由近距格中位数因果估计，随测随锚、绝不外溢为状态级 offset）；DGM 一致性 QA 门控（近距残差 MAD>1.5 m 时整 chunk 回退中位数锚定；门按 184 chunk 实测标定：正常本底 0.35–1.23、伪影 2–3 m） | **训**（单实例，两链共享同一 \(G_t\)；两链损失共同更新） |
 | 卫星 write head | DINO 特征 (+ 固定 XY 编码) \(\to Z_0\) | **训**（小投影/卷积，不训 DINO） |
 | XY write head | 零特征 + 同一固定 XY 编码走同一 write-head 结构 | **训**（与卫星 write head 容量对齐） |
 | updater \(U\) | \(Z_{t-1},G_t,M_t\to Z_t\) | **训**（单实例，两链共享） |
@@ -142,9 +142,10 @@ F_{1\rightarrow t} = E(Z_t; M_1) - E(Z_1; M_1)
 Loss：
 
 - 当前 \(M_t\)：冻结 height + density（局部写入）
-- 历史 visited：retention
+- 当前查询帧深度一致性（2026-08-28 修订）：\(Z_t\) 经冻结 depth reader 渲染到该 chunk 查询相机位姿，与该帧 LiDAR 深度做 masked 一致性（小权重）。依据机制诊断：写入落在 reader 零空间（latent 大改、读出不动），held-out depth_absrel 0.50→0.85 恶化；此项目的是把写入约束到 reader 可见方向。LiDAR 深度只进损失、不进任何前向输入，无泄漏。
+- 历史 visited：retention，但**排除当前 chunk 的 supervised 写入区**（`world_state.retention_mask`）。依据机制诊断：相邻 chunk support 重叠 0.87–0.98，原版保持项的锚定区几乎完全盖住写入区，与 E3 直接对抗。
 - \(Z_0\)：对静态累计云的 masked distill + height/density（初始化）
-- 无 depth loss、无 RGB 主损失、不把 \(Z_t\) 回归成整张未来 \(Z_{\mathrm{world}}\)
+- 无 RGB 主损失、不把 \(Z_t\) 回归成整张未来 \(Z_{\mathrm{world}}\)（深度一致性只用 LiDAR 几何，不用 RGB 像素）
 
 分支：不再有独立训练的分支。训练只跑一次 **shared_assimilation**
 （同 batch 双链：sat-init 与 XY-init 共享测量流/updater/readers，loss 为两链之和）；
@@ -171,5 +172,5 @@ Loss：
 - 训新的几何基础模型或视频 world model  
 - RGB 当主几何证据  
 - VLA / planning（最多作为后续下游，不进 v1）
-- **状态级单一全局高度 offset**（2026-08-27 校正探针：残差是坡度主导 75–81 m/km，完美标量的上限也只有 ahead 3.67→3.24 m；要标定必须是缓变坡度，另议）
+- **状态级单一全局高度 offset**（2026-08-27 校正探针：残差是坡度主导 75–81 m/km，完美标量的上限也只有 ahead 3.67→3.24 m；要标定必须是缓变坡度，另议。2026-08-29 注：测量内部 DGM 锚定的逐 chunk 常数 Δ 与本条不冲突——它是逐 chunk、随车移动、只存在于测量内的锚定，与既有中位数扣除同族）
 - **用 VGGT BEV 列均值高度做全局校准**（远距列均值被高空内容系统性污染：抬升/近格 +0.0/+1.7 m、>20 m 路面 +8.6 m、corr(误差,距离)=+0.66，估计的 offset 符号都会反；测量侧若要可靠的格子高度须改低分位数地面包络，另议）

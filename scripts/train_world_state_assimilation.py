@@ -42,15 +42,15 @@ from world3d.unified_bev.world_data import (  # noqa: E402
 from world3d.unified_bev.world_state import (  # noqa: E402
     WORLD_STATE_SCHEMA_VERSION,
     GroundMeasurement,
+    retention_mask,
     supervised_region,
-    visited_mask,
 )
 from world3d.unified_bev.world_vggt import (  # noqa: E402
     chunk_measurement_from_cache,
     load_world_vggt_cache,
     teacher_measurement,
 )
-from world3d.unified_bev.models import ColumnFieldDecoder  # noqa: E402
+from world3d.unified_bev.models import ColumnFieldDecoder, render_multi_view  # noqa: E402
 
 
 def _load_interface(path, device):
@@ -79,6 +79,15 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--steps", type=int, default=200)
     ap.add_argument("--unroll", type=int, default=4)
+    ap.add_argument("--depth_weight", type=float, default=0.1,
+                    help="weight of the query-frame LiDAR depth consistency "
+                         "rendered through the frozen depth reader; 0 disables")
+    ap.add_argument("--dgm_tiles", default=None,
+                    help="directory of BW DGM1 zips; enables the two-tier "
+                         "DGM ground anchor (near VGGT envelope + far surveyed "
+                         "terrain) with the per-chunk QA fallback")
+    ap.add_argument("--kitti360_root", default="/media/shizhm/sda1/KITTI-360",
+                    help="KITTI-360 sequence root for pose/UTM affine fitting")
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
@@ -92,6 +101,12 @@ def main():
     ck, fp, world_enc, height_r, density_r, depth_r = _load_interface(args.interface, device)
     validate_scenes_manifest(ck, ds.manifest_hash)
     vggt_caches: dict = {}
+    dgm_anchors: dict = {}
+    dgm_tile_set = None
+    if args.dgm_tiles is not None:
+        from world3d.unified_bev.dgm import DgmAnchor, DgmTileSet, anchor_tile_tensor
+        dgm_tile_set = DgmTileSet.from_dir(Path(args.dgm_tiles))
+        print(f"[world-b] DGM anchor enabled: {len(dgm_tile_set.rasters)} tiles from {args.dgm_tiles}")
     if args.vggt_cache is None:
         print("[world-b] WARNING: no --vggt_cache; using the LiDAR teacher "
               "measurement fallback (diagnostic only, E3 does not hold)")
@@ -138,6 +153,16 @@ def main():
                 args.vggt_cache, scene_id,
                 str(blob["world_target_version"]), str(blob["world_target_hash"]),
             )
+        dgm_tile = None
+        if dgm_tile_set is not None:
+            if scene_id not in dgm_anchors:
+                anchor = DgmAnchor.from_blob(blob, dgm_tile_set, Path(args.kitti360_root))
+                dgm_anchors[scene_id] = anchor_tile_tensor(
+                    anchor, inputs.origin_xy[0].numpy(), ds.bev_size,
+                    float(spec.resolution_m), device,
+                )
+                print(f"[world-b] dgm anchor fit rmse={anchor.fit_rmse_m:.2f} m ({scene_id})", flush=True)
+            dgm_tile = dgm_anchors[scene_id]
         with torch.no_grad():
             z_world = world_enc(height, density, valid)
 
@@ -152,6 +177,8 @@ def main():
                     chunk_index=t + 1,
                     query_fid=int(blob["chunk_table"][t]["core_fid"]),
                     detach=detach_latent,
+                    dgm_abs_z=None if dgm_tile is None else dgm_tile[0],
+                    dgm_valid=None if dgm_tile is None else dgm_tile[1],
                 )
             support = chunk_support[:, t]
             latent = world_enc(height * support, density * support, support)
@@ -191,10 +218,33 @@ def main():
                 supervised = supervised_region(meas.support, valid)
                 loss = loss + masked_smooth_l1(height_r(state.latent), height, supervised)
                 loss = loss + masked_smooth_l1(density_r(state.latent), density, supervised)
+                # depth consistency: render the state at the held-out query
+                # camera of THIS chunk and match the frame's real LiDAR depth.
+                # The reader stays frozen; gradients flow through it into the
+                # latent so writes must land in reader-visible directions
+                # (mechanism diag 2026-08-28: large latent deltas, ~zero
+                # readout change, depth_absrel 0.50 -> 0.85 on held-out).
+                if args.depth_weight > 0:
+                    q = meas.chunk_index - 1
+                    gt_d = sup.query_depth[:, q].to(device)
+                    gm = sup.query_depth_mask[:, q].to(device)
+                    if gm.any():
+                        _, pred_d, _ = render_multi_view(
+                            depth_r, state.latent,
+                            sup.query_K[:, q].to(device),
+                            sup.query_T_world_cam[:, q].to(device),
+                            spec.origin_xy,
+                            tile_size_m=ds.tile_size_m,
+                            image_size=(gt_d.shape[-1], gt_d.shape[-2]),
+                        )
+                        loss = loss + args.depth_weight * masked_smooth_l1(pred_d, gt_d, gm)
                 if meas.chunk_index > 1:
+                    # retention anchors the old visited region EXCEPT the
+                    # cells this chunk supervises (they are being rewritten;
+                    # support overlap 0.87-0.98 made the old mask fight E3)
                     loss = loss + 0.1 * masked_smooth_l1(
                         height_r(state.latent), height_r(prev.latent).detach(),
-                        visited_mask(chunk_support, meas.chunk_index - 1),
+                        retention_mask(chunk_support, meas.chunk_index, supervised),
                     )
             return state, loss
 
@@ -221,7 +271,8 @@ def main():
                 "updater": updater.state_dict(),
                 "measurement_encoder": meas_enc.state_dict(),
                 "branch": "shared_assimilation",
-                "measurement_source": "vggt_cache" if args.vggt_cache else "lidar_teacher_fallback",
+                "measurement_source": ("vggt_cache+dgm" if args.dgm_tiles
+                                       else "vggt_cache") if args.vggt_cache else "lidar_teacher_fallback",
                 "step": step,
                 "config": vars(args),
             }, out / "assimilation.pt")

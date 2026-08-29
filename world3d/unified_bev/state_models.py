@@ -302,6 +302,9 @@ class GroundMeasurementEncoder(nn.Module):
         reliable_range_m: float = 25.0,
         ground_quantile: float = 0.15,
         camera_height_above_road_m: float = 1.75,
+        trusted_range_m: float = 15.0,
+        dgm_gate_mad_m: float = 1.5,
+        dgm_min_trusted_cells: int = 100,
     ):
         super().__init__()
         self.lift = GroundDenseBEVEncoder(
@@ -317,6 +320,9 @@ class GroundMeasurementEncoder(nn.Module):
         self.reliable_range_m = float(reliable_range_m)
         self.ground_quantile = float(ground_quantile)
         self.camera_height_above_road_m = float(camera_height_above_road_m)
+        self.trusted_range_m = float(trusted_range_m)
+        self.dgm_gate_mad_m = float(dgm_gate_mad_m)
+        self.dgm_min_trusted_cells = int(dgm_min_trusted_cells)
 
     def _gate(self, dense_depth: torch.Tensor, dense_conf: torch.Tensor) -> torch.Tensor:
         depth = torch.nan_to_num(dense_depth.float(), nan=0.0, posinf=0.0, neginf=0.0)
@@ -338,13 +344,31 @@ class GroundMeasurementEncoder(nn.Module):
         origin_xy: torch.Tensor,
         resolution_m: float,
         z_datum_m: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        dgm_abs_z: Optional[torch.Tensor] = None,
+        dgm_valid: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """Datum-relative ground-envelope height of one chunk's measurement.
 
-        Returns ``(h_rel [B,1,H,W], support [B,1,H,W] bool, anchor_offset_m)``.
-        The anchor removes the chunk-LOCAL VGGT ground bias against the
-        camera-rig reference; it is applied inside this measurement only and
-        must never become a state-level global offset (experiment_plan §8).
+        Returns ``(h_rel [B,1,H,W], support [B,1,H,W] bool, dgm_qa dict)``.
+        Two-tier anchoring (2026-08-29; validated by scripts/qa_dgm_scene_check.py,
+        road-cell MAD vs our static targets: median 3.5 cm after one constant
+        per-scene offset):
+
+        - trusted tier (points <= trusted_range_m): VGGT envelope, centered on
+          the DGM-agreement median ``delta`` instead of the camera rig — the
+          surveyed terrain is the better absolute reference
+        - far tier (support cells with only 15-25 m points): the chunk writes
+          ``dgm + delta`` — the surveyed bare-earth shape, not the slope-biased
+          far envelope (the "bent ruler" on descending routes)
+
+        ``delta`` is per chunk, measured-internal, and never leaves this call
+        as a state-level offset (experiment_plan §8).  QA gate: if the trusted
+        tier disagrees with DGM beyond ``dgm_gate_mad_m`` MAD (bridges, tile
+        edges, canopy artifacts) the whole chunk falls back to the legacy
+        camera-rig median anchor — fail-safe to the pre-DGM behavior.  The
+        gate default 1.5 m is calibrated on 184 chunks (2026-08-29,
+        scripts/calibrate_dgm_gate.py): normal trusted-tier envelope noise
+        spans MAD 0.35-1.23 (p99 1.15), artifacts sit at 2-3 m.
         """
         B, N, H, W = dense_depth.shape
         gate, depth = self._gate(dense_depth, dense_conf)
@@ -354,17 +378,58 @@ class GroundMeasurementEncoder(nn.Module):
             self.bev_height, self.bev_width, quantile=self.ground_quantile,
         )
         support = count > 0
+        datum = z_datum_m.view(B, 1, 1, 1).to(z_ground.dtype)
         road_ref = (
             torch.median(T_world_cam[..., 2, 3].float().reshape(-1))
             - self.camera_height_above_road_m
         )
-        if bool(support.any()):
-            anchor = z_ground[support].median() - road_ref
-        else:
-            anchor = z_ground.new_zeros(())
-        datum = z_datum_m.view(B, 1, 1, 1).to(z_ground.dtype)
-        h_rel = (z_ground - anchor - datum) * support.to(z_ground.dtype)
-        return h_rel, support, anchor
+
+        def _legacy() -> Tuple[torch.Tensor, dict]:
+            if bool(support.any()):
+                anchor = z_ground[support].median() - road_ref
+            else:
+                anchor = z_ground.new_zeros(())
+            h = (z_ground - anchor - datum) * support.to(z_ground.dtype)
+            return h, {"status": "legacy", "anchor_m": float(anchor)}
+
+        if dgm_abs_z is None:
+            h_rel, qa = _legacy()
+            return h_rel, support, qa
+
+        trusted = gate & (depth <= self.trusted_range_m)
+        _, count_trusted = ground_height_quantile(
+            pts, trusted.view(B, N, H * W), origin_xy, resolution_m,
+            self.bev_height, self.bev_width, quantile=self.ground_quantile,
+        )
+        support_trusted = count_trusted > 0
+        both = support_trusted & dgm_valid.to(support_trusted.dtype).bool()
+        if int(both.sum()) < self.dgm_min_trusted_cells:
+            h_rel, qa = _legacy()
+            qa["status"] = "fallback_min_cells"
+            return h_rel, support, qa
+
+        r = (z_ground - dgm_abs_z.to(z_ground.dtype))[both]
+        delta = r.median()
+        mad = (r - delta).abs().median()
+        if float(mad) > self.dgm_gate_mad_m:
+            h_rel, qa = _legacy()
+            qa["status"] = "fallback_mad"
+            qa["dgm_mad_m"] = float(mad)
+            return h_rel, support, qa
+
+        # tier 1: trusted cells keep the VGGT envelope, DGM-centered
+        # tier 2: far cells take the surveyed terrain dgm + delta
+        tier2 = support & ~support_trusted & dgm_valid.to(support.dtype).bool()
+        h_rel = torch.where(
+            tier2,
+            dgm_abs_z.to(z_ground.dtype) + delta - datum,
+            z_ground - delta - datum,
+        ) * support.to(z_ground.dtype)
+        qa = {
+            "status": "dgm", "delta_m": float(delta), "dgm_mad_m": float(mad),
+            "n_trusted_dgm": int(both.sum()), "n_tier2": int(tier2.sum()),
+        }
+        return h_rel, support, qa
 
     def forward(
         self,
@@ -377,13 +442,16 @@ class GroundMeasurementEncoder(nn.Module):
         resolution_m: float,
         z_datum_m: torch.Tensor,
         chunk_index: int,
+        dgm_abs_z: Optional[torch.Tensor] = None,
+        dgm_valid: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> GroundMeasurement:
         assert_no_supervision_leak(kwargs, context="GroundMeasurementEncoder")
         B, N, _, H, W = images.shape
         gate, depth = self._gate(dense_depth, dense_conf)
-        h_rel, support, _anchor = self.ground_field(
+        h_rel, support, dgm_qa = self.ground_field(
             dense_depth, dense_conf, K, T_world_cam, origin_xy, resolution_m, z_datum_m,
+            dgm_abs_z=dgm_abs_z, dgm_valid=dgm_valid,
         )
         feat = self.lift.image_encoder(images.reshape(B * N, 3, H, W))
         if feat.shape[-2:] != (H, W):
@@ -414,7 +482,7 @@ class GroundMeasurementEncoder(nn.Module):
             height=self.bev_height, width=self.bev_width,
         )
         confidence = torch.where(support, conf_splat.clamp(0.0, 1.0), torch.zeros_like(conf_splat))
-        meas = GroundMeasurement(z, support, confidence, int(chunk_index))
+        meas = GroundMeasurement(z, support, confidence, int(chunk_index), dgm_qa=dgm_qa)
         meas.validate(SceneTileSpec(
             scene_id="measurement", origin_xy=origin_xy,
             tile_size_m=float(self.bev_height) * float(resolution_m),

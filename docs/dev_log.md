@@ -323,6 +323,38 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 - `LABEL_POLICY_VERSION → official_labels_verified_v2`（label_policy_hash 随之变化 → 现有 v3 blob 按身份链自动可判失效，需用新名单重建 targets+重训——当前 overnight 链跑的是 v1 名单产物，其结果定位为"pre-verification 基线"，校验后差异若显著再决定是否重跑）。
 - 42/42 测试通过；formal 链健康（interface step 1680/5000，loss 2.66→0.36，GPU 96%）。
 
+### 2026-08-28 — E3/E4 不过的机制诊断（diag_e3_e4_mechanism.py，train 22 scene vs held-out 0003）
+
+- **判决先行：E3/E4 失败是 held-out 域差，不是没学会写**。训练集上 updater 正常工作：g_update 中位 **+0.104**（130/176 步为正，t>4 后 +0.224），err_before 0.93→err_after 0.55，recurrent 在 **22/22** 训练 scene 上优于 one-shot（中位差 −0.255）；held-out 0003 上同一组权重 g_update 中位塌到 **+0.028**（4/8 为正），recurrent 反而输 one-shot +0.113。
+- **held-out 是已知最坏情形（下坡 scene）**：①测量沿程劣化——meas_readout_err 2.77→6.45（train 中位 1.94 平稳），08-27 校正探针已证明 75–81 m/km 坡度在 25 m 包络内造成 ~2 m 系统性倾斜，标量中位锚定去不掉；②到达区域被陈旧远距写入占据——err_before 沿程单调爬升 3.18→5.84，逐步 ±0.1 的修正量永远修不掉前一 chunk 的远距偏差；③训练集几乎全是平地（0000×21+0006×1），该失效模式在训练中未出现，meas_enc/updater 对它零适应。
+- **次级机制（两侧都在、held-out 放大）**：写入方向落在 reader 零空间——latent_delta_in 很大（train 1.19/held-out 0.64）但读出变化 ~0（t=1 时测量读出 2.77 明明优于状态 3.18，写入后反而 3.26）；64 维 latent 只有少数方向被 height reader 读出，无 depth 约束使 depth reader 方向自由漂移（depth_absrel 0.50→0.85 的恶化是免费旁证）。retention_overlap train 0.87 / held-out 0.98：保持项的锚定区几乎覆盖整个写入区，对弱写入态是额外拖累。
+- **E4 勘误（上一轮判读有误）**：forget₁→ₜ 全为负（train −0.53 / held-out −0.62，负=改善），**遗忘门实际通过**；E4 只输在 one-shot 对比条款（held-out persistent 4.76 vs one-shot 4.41，差 7.9%>2%）。forget 恶化之说作废。
+- **对下一步的含义**：当前"held-out 判死"建立在 n=1 且是对抗性 scene 上；先补 v2 名单 targets + 多个 held-out scene（含平地）再定生死；训练侧要加地形多样性或让测量对倾斜鲁棒（§8 禁的是全局标量 offset，不禁止局部/1D 坡度）；同化期写入需约束到 reader 可见方向（加 depth 读出一致性）。
+- 产物：`scripts/diag_e3_e4_mechanism.py`、`runs/world_state_v3_formal_20260828/diag_e3_e4_{train,heldout}.jsonl`。
+
+### 2026-08-28 — E3 修复第一轮：查询帧深度一致性 + retention 排除当前写入区（用户批准执行）
+
+- **文档先行**：experiment_plan §2 Stage-A readers 行改写（reader 权重不更新，但 depth 读出一致性梯度穿过冻结 reader 到 latent）；§6 Loss 增补两项并附机制诊断依据，"无 depth loss"表述废除（RGB 仍不作主监督，深度只用 LiDAR 几何）。
+- **代码**：①`world_state.retention_mask(chunk_support, chunk_index, current_supervised)` 新契约函数（`visited_mask(t-1) & ¬当前supervised`）；②`train_world_state_assimilation.py` 新增 `--depth_weight`（默认 0.1）：每个 recent 步把 `state.latent` 经冻结 `depth_r` 用 `render_multi_view` 渲到该 chunk 查询相机位姿，与 `sup.query_depth`（LiDAR 真值，仅入损失不入前向，无泄漏）masked smooth-L1；retention 改用 `retention_mask`。
+- **测试**：新增 `test_retention_mask_excludes_current_write_region`（锚定区排除当前写入、老格保持、未访不锚、chunk1 拒绝）；43/43 通过（21+22）。
+- **smoke（22 train scene，20 步，held-out 0003 评估）**：**g_update 8/8 全为正**（+0.12~+0.49；对照旧 8000 步模型中位 +0.028、半数为负）；**depth_absrel 0.40→0.26–0.40 不再单调恶化**（旧模型 0.50→0.85）；`outside_latent_max=0.0` 精确保持契约不变；height_visited_mae t=8 达 4.41（旧 4.76，与 one_shot 持平）。20 步 smoke 只证机制方向，不作效果结论。
+- **遗留**：下坡"弯尺子"（测量侧倾斜）未治——训练集地形多样性或测量内 1D 坡度估计另议；正式长训练待 v2 名单 targets 重建后启动。
+
+### 2026-08-29 — DGM1 地形锚定：对齐验证 + 双层测量锚定接入（用户拍板直接开工）
+
+- **对齐验证（三步，脚本入 scripts/，数据入 runs/dgm_alignment_check/）**：①drive 级 LiDAR-vs-DGM voxel 检查（qa_dgm_alignment.py，修过一处 velodyne 外参错用 cam_to_pose 的 bug——曾造成 31% 点"沉入"DTM）；②600 帧窗垂直漂移分析（qa_dgm_vertical_drift.py）：0003 漂移 ≤0.25 m、0000/0009 有 ±0.2–0.5 m 局部伪影、0010 连续 6 窗 +1.7–2.9 m（疑似桥/源错误，需门控）；③**scene 级终检（qa_dgm_scene_check.py）：23/23 scene 路面格 MAD 中位 3.5 cm、最差 15.3 cm（逐 scene 一个常数 offset 后）——DGM1 与静态真值厘米级吻合，判决强 GO**。已知语义：semantic_top 存原始 ID（7/8/9/22=路/人行道/停车/地形），非 ×1000 编码。
+- **实现**：①`world3d/unified_bev/dgm.py`：DgmTileSet（zip 内 100 万行 xyz 快速加载）、`fit_world_to_utm`（逐 scene 仿射，实测 RMSE 0.03–0.49 m）、`DgmAnchor.from_blob`（blob 的 geometry_fids 上拟合）+ `anchor_tile_tensor`；②`state_models.ground_field` 双层锚定：近距（≤15 m trusted）格保 VGGT 包络（中心改用 DGM 一致性中位 Δ）、**远距格（仅 15–25 m 点）写 `dgm + Δ`——勘测裸地形状替代坡度偏置的远距包络**；Δ 逐 chunk 由近距格中位数因果估计，只存在于测量内（§8 合规）；③QA 门控：trusted 层 vs DGM 残差 MAD 超门 → 整 chunk 回退 legacy 中位锚定（失败方向安全）；④`GroundMeasurement` 增 `dgm_qa` 审计字段，eval 行落盘 `dgm_status/dgm_mad_m/dgm_tier2_cells`；训练/eval/diag 三脚本接 `--dgm_tiles`（训练与评估必须同开关，否则输入分布错配）。
+- **门控标定（calibrate_dgm_gate.py，184 chunk 实测）**：trusted 层"包络噪声"本底 MAD 0.35–1.23（train p99=1.15），伪影带 2–3 m；初版 0.5 m 门（按静态真值一致性定）导致全部 chunk 保守回退——改默认 **1.5 m**（p99 的 1.3 倍、伪影下界的 0.75 倍）。
+- **验证**：46/46 单测（新增 tile 采样/仿射拟合精确性、双层锚定、MAD 门控回退三测试）；0003 真实 smoke 全链通（20 scene anchor 拟合、8/8 chunk `dgm` 状态生效、**每 chunk 4505 个远格接勘测地形**、g_update 8/8 为正、outside_latent_max=0.0 保持）。
+- **输入层判决（diag_dgm_input_quality.py，held-out 0003 全部 tier2 远格，与训练无关）**：legacy 中位误差 **2.578 m → DGM 1.403 m（−46%）**，MAE 3.352→2.692；chunk 5/6 的中位误差压到 **0.24/0.15 m**——弯尺子在源头被扳直，方案 A（1D 坡度）正式作废，方案 B 降级为可选。
+- **诚实边界**：20 步 smoke 的端点指标与无 DGM 持平（visited 4.402 vs 4.409）——收益在"到达时刻的陈旧写入质量"，需要正式长训练让 meas_enc/updater 学会利用干净输入；tier2 写裸地高程，在目标为建筑顶的格上与真值固有差异（到达后由测量纠正，非新增问题）；0010 类伪影段依赖门控拦截（本 smoke 未覆盖该 drive）。未 commit。
+
+### 2026-08-29 — 退役 probe_height_correction.py（用户裁定）
+
+- **删除**：`scripts/probe_height_correction.py`（08-27 弯尺子诊断探针）。动机：DGM 锚定上线后其历史使命结束（方案 A 作废、§8 两条禁令的实验依据已固化在 experiment_plan 与本日志）。
+- **保留**：结果 JSON `runs/world_state_e0/height_correction.json`（untracked 数据）；dev_log 08-27 的诊断记录（含坡度 75–81 m/km、标量校正符号反转等数字）。按 E0 探针先例的差别：E0 的信息上限判决仍是 E1 判读工具故保留探针，本探针的结论已完全被后续工程取代。
+- 验证：compileall 通过，46/46 单测通过；无任何代码引用残留。
+
 ### 2026-08-28 — 清理第一、二组退役代码（frame 链 + ICASSP27 试点）
 
 - **第一组（旧 frame unified-BEV 链，13 文件）**：`run_unified_bev_claim_probe.sh`、`train_unified_bev_stage_a/b.py`、`eval_unified_bev_probe.py`、`consistency_unified_bev_multichain.py`、`build_unified_bev_cache.py`、`check_unified_bev_replay.py`、`compare_unified_bev_paired.py`、`smoke_unified_bev.py`、`diag_vggt_gate.py`、`export_vggt_metric_pointmap.py`、`render_vggt_pointmap_views.py`、`visualize_dense_reconstruction.py`，及 `configs/unified_bev_stage_a/b.yaml`（无 reader）。

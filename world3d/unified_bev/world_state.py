@@ -113,6 +113,7 @@ class GroundMeasurement:
     support: Tensor
     confidence: Tensor
     chunk_index: int
+    dgm_qa: Optional[dict] = None  # DGM two-tier anchor audit trail; None = legacy
 
     def validate(self, spec: SceneTileSpec) -> None:
         spec.validate()
@@ -300,3 +301,17 @@ def supervised_region(measurement_support: Tensor, world_valid: Tensor) -> Tenso
     0 — pseudo-negative labels, not masked supervision.
     """
     return measurement_support.bool() & world_valid.bool()
+
+
+def retention_mask(chunk_support: Tensor, chunk_index: int, current_supervised: Tensor) -> Tensor:
+    """Where the retention loss may anchor the current step to the previous readout.
+
+    ``chunk_support`` is [B,T,1,H,W]; ``chunk_index`` is the 1-based chunk being
+    assimilated right now.  Consecutive measurement supports overlap the visited
+    mask by 0.87-0.98 on real routes, so anchoring the full pre-chunk visited
+    region fights the current write on almost every supervised cell (E3).  The
+    cells the current chunk supervises are excluded; they are being rewritten.
+    """
+    if chunk_index < 2:
+        raise ValueError("retention needs a previous chunk")
+    return visited_mask(chunk_support, chunk_index - 1) & ~current_supervised.bool()
