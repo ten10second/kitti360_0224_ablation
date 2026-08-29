@@ -81,6 +81,38 @@ def main():
         print(f"ALL tier2 cells: legacy med={float(leg.median()):.3f} mae={float(leg.mean()):.3f} | "
               f"dgm med={float(dgm.median()):.3f} mae={float(dgm.mean()):.3f}")
 
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import json as _json
+    med_leg = [float(x.median()) for x in agg_leg]
+    med_dgm = [float(x.median()) for x in agg_dgm]
+    mae_leg = [float(x.mean()) for x in agg_leg]
+    mae_dgm = [float(x.mean()) for x in agg_dgm]
+    ts = [t + 1 for t in range(len(agg_leg))]
+    fig, axes = plt.subplots(1, 2, figsize=(9.5, 3.6))
+    for ax, (a, b, title) in zip(axes, [
+        (med_leg, med_dgm, "median |error| on far cells (m)"),
+        (mae_leg, mae_dgm, "mean |error| on far cells (m)"),
+    ]):
+        ax.bar([t - 0.18 for t in ts], a, width=0.36, label="legacy anchor", color="#b2182b")
+        ax.bar([t + 0.18 for t in ts], b, width=0.36, label="DGM-anchored", color="#1a6fae")
+        ax.set_xticks(ts)
+        ax.set_xlabel("chunk index")
+        ax.set_title(title, fontsize=10)
+        ax.grid(alpha=0.3, axis="y")
+    axes[0].legend(fontsize=9)
+    fig.suptitle("Far-cell ground estimates: VGGT envelope vs surveyed-terrain anchor (held-out scene)", fontsize=11)
+    fig.tight_layout()
+    out = Path("runs/advisor_briefing/fig3_dgm_anchor.png")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150)
+    Path("runs/advisor_briefing/fig3_dgm_anchor.json").write_text(_json.dumps({
+        "chunk": ts, "median_legacy_m": med_leg, "median_dgm_m": med_dgm,
+        "mae_legacy_m": mae_leg, "mae_dgm_m": mae_dgm,
+    }, indent=2))
+    print(f"-> {out}")
+
 
 if __name__ == "__main__":
     main()

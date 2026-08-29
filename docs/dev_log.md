@@ -355,6 +355,23 @@ WITH_PERCEPTUAL=0 bash scripts/run_unified_bev_claim_probe.sh
 - **保留**：结果 JSON `runs/world_state_e0/height_correction.json`（untracked 数据）；dev_log 08-27 的诊断记录（含坡度 75–81 m/km、标量校正符号反转等数字）。按 E0 探针先例的差别：E0 的信息上限判决仍是 E1 判读工具故保留探针，本探针的结论已完全被后续工程取代。
 - 验证：compileall 通过，46/46 单测通过；无任何代码引用残留。
 
+### 2026-08-29 — v4 正式链：v2 名单 + DGM 锚定 + 深度一致性长训练（E3/E4 首次过门）
+
+- **链**：`run_world_state_formal_v4.sh` 一键完成 targets 重建 → VGGT 缓存重建 → interface 5000 → shared assimilation 8000（`--dgm_tiles`）→ 9 control 评估 → paired → SUMMARY；产物 `runs/world_state_v4_formal_20260829/`（run_metadata 记录 git commit/开关）。
+- **训练集扩容**：v2 名单下 max_scenes=64 构建出 **64 train scene（0000×39、0005×21、0006×4，skip 2）**——地形多样性顺带改善（0005 首次进入训练）；test 仍为 0003 单 scene。
+- **E1–E4 判定（held-out 0003，对 v3 pre-verification 基线）**：
+  | 实验 | v3 基线 | v4 | 门控 |
+  |---|---|---|---|
+  | E1 ahead t0 aligned vs xy vs shift | 4.43 < 5.25，shift 裕量 0.07–0.11 | **4.14 < 4.73**，shift 裕量 0.09–0.11 | 方向 ✓（裕量仍薄，n=1） |
+  | E2 同 updater sat vs xy | +0.82 | **+0.60**（t8 收敛 3.799 vs 3.806）| 方向 ✓（n=1） |
+  | E3 g_update 中位 | +0.028（4/8 正）| **+0.303（6/8 正）** | **过门** |
+  | E4 persistent vs one-shot | 4.76 输 4.41（差 7.9%）| **3.799 优于 4.123（7.9%）** | **过门（反超）** |
+  | E4 遗忘 forget₁→ₜ | 全负 ✓ | 全负（−0.40→−0.01）✓ | 过门 |
+  | depth_absrel 终值 | 0.851（恶化）| **0.528**（t0 0.503，不再恶化）| 佐证修复 |
+  | outside_latent_max | 0.0 | 0.0 全程 | 硬契约保持 |
+- **归并诚实声明**：本轮同时引入四个变化（v2 名单、64 scene 扩容、DGM 锚定、深度一致性+retention 修复），E3/E4 翻转是合并效果，未做单因子消融；ground_only 终值 visited 3.615 略优于 aligned 3.799（单 scene 噪声量级，不动摇"卫星管 ahead、ground 管校正"的分工叙事，留观）。
+- 64 scene 下 assimilation 终损 8.50（sat 3.24/xy 5.52）与 v3 的 2.86 不可比（深度项入损+数据集变了）。下一步按协议扩 32 scene × 3 seed bootstrap 前先补多 held-out scene（单 scene CI 无意义）。
+
 ### 2026-08-28 — 清理第一、二组退役代码（frame 链 + ICASSP27 试点）
 
 - **第一组（旧 frame unified-BEV 链，13 文件）**：`run_unified_bev_claim_probe.sh`、`train_unified_bev_stage_a/b.py`、`eval_unified_bev_probe.py`、`consistency_unified_bev_multichain.py`、`build_unified_bev_cache.py`、`check_unified_bev_replay.py`、`compare_unified_bev_paired.py`、`smoke_unified_bev.py`、`diag_vggt_gate.py`、`export_vggt_metric_pointmap.py`、`render_vggt_pointmap_views.py`、`visualize_dense_reconstruction.py`，及 `configs/unified_bev_stage_a/b.yaml`（无 reader）。

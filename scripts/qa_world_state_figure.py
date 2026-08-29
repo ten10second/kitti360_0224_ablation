@@ -56,6 +56,9 @@ def main():
     ap.add_argument("--assimilation", default="runs/world_state_assim_depth_smoke/assimilation.pt")
     ap.add_argument("--out", default="runs/world_state_assim_depth_smoke/qa_filling_in.png")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--dgm_tiles", default=None,
+                    help="must match the checkpoint's training-time anchor")
+    ap.add_argument("--kitti360_root", default="/media/shizhm/sda1/KITTI-360")
     args = ap.parse_args()
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
@@ -95,11 +98,21 @@ def main():
         state = sat_init(sat, spec)
         snapshots = {0: state}
         for t in range(chunk_support.shape[1]):
+            dgm_tile = None
+            if args.dgm_tiles is not None:
+                from world3d.unified_bev.dgm import DgmAnchor, DgmTileSet, anchor_tile_tensor
+                if not hasattr(main, "_dgm_tiles"):
+                    main._dgm_tiles = DgmTileSet.from_dir(Path(args.dgm_tiles))
+                anchor = DgmAnchor.from_blob(blob, main._dgm_tiles, Path(args.kitti360_root))
+                dgm_tile = anchor_tile_tensor(anchor, inputs.origin_xy[0].numpy(),
+                                              ds.bev_size, float(spec.resolution_m), device)
             meas = chunk_measurement_from_cache(
                 meas_enc, cache["chunks"][str(t + 1)],
                 origin_xy=spec.origin_xy, resolution_m=float(spec.resolution_m),
                 z_datum_m=spec.z_datum_m, chunk_index=t + 1,
                 query_fid=int(blob["chunk_table"][t]["core_fid"]), detach=True,
+                dgm_abs_z=None if dgm_tile is None else dgm_tile[0],
+                dgm_valid=None if dgm_tile is None else dgm_tile[1],
             )
             state = updater(state, meas).state
             snapshots[t + 1] = state
